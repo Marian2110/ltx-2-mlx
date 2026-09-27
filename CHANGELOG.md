@@ -10,6 +10,21 @@ version: breaking changes bump `y`, additive changes bump `z`. See
 [`docs/PIPELINE_MATURITY.md`](docs/PIPELINE_MATURITY.md) for per-pipeline
 stability guarantees.
 
+## [0.15.12](https://github.com/dgrauet/ltx-2-mlx/compare/v0.15.11...v0.15.12) (2026-09-27)
+
+
+### Features
+
+* **pipelines:** TeaCache stage-1 acceleration for a2v ([#129](https://github.com/dgrauet/ltx-2-mlx/issues/129)) ([45d1b70](https://github.com/dgrauet/ltx-2-mlx/commit/45d1b7006d328035e4351ba0fb99b27192ba6c1a))
+
+
+### Bug Fixes
+
+* **core:** run the DurationHead pooler attention through fused SDPA ([#124](https://github.com/dgrauet/ltx-2-mlx/issues/124)) ([3e4ea99](https://github.com/dgrauet/ltx-2-mlx/commit/3e4ea99c1eb41f1678ed5904bdb6cd23522f9d20))
+* **pipelines:** keep the terminal sigma when stage steps are shortened ([#141](https://github.com/dgrauet/ltx-2-mlx/issues/141)) ([14ee96f](https://github.com/dgrauet/ltx-2-mlx/commit/14ee96f5267515149faa3427d16c6b8c18a5c10c))
+* **pipelines:** reject a2v audio shorter than the requested clip ([#165](https://github.com/dgrauet/ltx-2-mlx/issues/165)) ([7db16c2](https://github.com/dgrauet/ltx-2-mlx/commit/7db16c2d2c1a7bdf0be18a55fc03121c5ad4ba7c)), closes [#164](https://github.com/dgrauet/ltx-2-mlx/issues/164)
+* **scripts:** pass frame_rate in calibrate_teacache, clear ty findings, make ty blocking ([#166](https://github.com/dgrauet/ltx-2-mlx/issues/166)) ([1d3f522](https://github.com/dgrauet/ltx-2-mlx/commit/1d3f5227b03330c0665b5a97d4c58d42e7e7ade4))
+
 ## [0.15.11](https://github.com/dgrauet/ltx-2-mlx/compare/v0.15.10...v0.15.11) (2026-09-26)
 
 
