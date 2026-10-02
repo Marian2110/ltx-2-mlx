@@ -198,6 +198,7 @@ class BlockStreamer:
         idx: int,
         evict_previous: int | None = None,
         lora_sources: list[BlockLoraSource] | None = None,
+        cast_dtype: mx.Dtype | None = None,
     ) -> None:
         """Load block ``idx``'s weights into ``block`` in-place.
 
@@ -219,6 +220,10 @@ class BlockStreamer:
                 GC even after the bound block is replaced. For
                 streaming inference, pass the previously-bound index
                 so peak resident memory stays at ~one block.
+            cast_dtype: If given, cast the float parameters of the block's
+                attention / feed-forward modules to this dtype after any LoRA
+                fusion (streamed counterpart of ``LTXModel.set_compute_dtype``).
+                The AdaLN tables keep their stored dtype.
         """
         if idx not in self._block_key_map:
             raise KeyError(f"block {idx} not in streamer")
@@ -234,6 +239,14 @@ class BlockStreamer:
 
         if lora_sources:
             weights = self._fuse_lora_into_block(weights, idx, lora_sources)
+
+        if cast_dtype is not None:
+            prefixes = tuple(f"{name}." for name, _ in block.compute_modules())
+            floats = (mx.float16, mx.bfloat16, mx.float32)
+            weights = [
+                (name, w.astype(cast_dtype) if name.startswith(prefixes) and w.dtype in floats else w)
+                for name, w in weights
+            ]
 
         block.load_weights(weights, strict=True)
 
@@ -341,6 +354,16 @@ class StreamingLTXModel(nn.Module):
         object.__setattr__(self, "_shared_block", shared)
         object.__setattr__(self, "_compiled_block", compiled)
         object.__setattr__(self, "_lora_sources", lora_sources or [])
+        object.__setattr__(self, "_cast_dtype", None)
+
+    def set_compute_dtype(self, dtype: mx.Dtype | None) -> None:
+        """Streamed ``LTXModel.set_compute_dtype``: every block is cast as it is bound."""
+        inner = super().__getattr__("inner")
+        inner.set_compute_dtype(dtype)
+        shared = object.__getattribute__(self, "_shared_block")
+        # The compiled block bakes the module dtypes in when it is traced: retrace.
+        object.__setattr__(self, "_compiled_block", mx.compile(shared, inputs=shared))
+        object.__setattr__(self, "_cast_dtype", dtype)
 
     def __call__(self, *args, **kwargs):
         # Inject block_provider unless caller already passed one.
@@ -349,6 +372,8 @@ class StreamingLTXModel(nn.Module):
             shared = object.__getattribute__(self, "_shared_block")
             compiled = object.__getattribute__(self, "_compiled_block")
             lora_sources = object.__getattribute__(self, "_lora_sources")
+            cast_dtype = object.__getattribute__(self, "_cast_dtype")
+            inner = super().__getattr__("inner")
             prev_idx: list[int | None] = [None]
 
             # mx.compile can only trace functions that take pytrees of
@@ -366,9 +391,13 @@ class StreamingLTXModel(nn.Module):
                     idx,
                     evict_previous=prev_idx[0],
                     lora_sources=lora_sources or None,
+                    cast_dtype=cast_dtype,
                 )
                 prev_idx[0] = idx
-                return compiled if use_compiled else shared
+                # The compiled block was traced with ``cast_dtype`` as the compute
+                # dtype; once the overflow guard drops it, run the eager block.
+                traced = inner.compute_dtype is cast_dtype
+                return compiled if use_compiled and traced else shared
 
             kwargs["block_provider"] = provider
         # The lazy AdaLN carrier (``PerTokenAdaLNParams``) is a non-tree
