@@ -33,6 +33,7 @@ hundred MB) + mmap metadata (~50 MB) ≈ ~1 GB.
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -355,6 +356,9 @@ class StreamingLTXModel(nn.Module):
         object.__setattr__(self, "_compiled_block", compiled)
         object.__setattr__(self, "_lora_sources", lora_sources or [])
         object.__setattr__(self, "_cast_dtype", None)
+        # The inner model's overflow guard drops the compute dtype through this wrapper,
+        # so that later binds stop casting too (weak: the wrapper owns the model).
+        object.__setattr__(model, "_compute_dtype_owner", weakref.ref(self))
 
     def set_compute_dtype(self, dtype: mx.Dtype | None) -> None:
         """Streamed ``LTXModel.set_compute_dtype``: every block is cast as it is bound."""
@@ -370,9 +374,7 @@ class StreamingLTXModel(nn.Module):
         if kwargs.get("block_provider") is None:
             streamer = object.__getattribute__(self, "_streamer")
             shared = object.__getattribute__(self, "_shared_block")
-            compiled = object.__getattribute__(self, "_compiled_block")
             lora_sources = object.__getattribute__(self, "_lora_sources")
-            cast_dtype = object.__getattribute__(self, "_cast_dtype")
             inner = super().__getattr__("inner")
             prev_idx: list[int | None] = [None]
 
@@ -386,6 +388,9 @@ class StreamingLTXModel(nn.Module):
             use_compiled = kwargs.get("perturbations") is None
 
             def provider(idx: int) -> nn.Module:
+                # Read the dtype and the compiled block at bind time: the overflow guard
+                # can drop the setting mid-forward, and its recompute reuses this provider.
+                cast_dtype = object.__getattribute__(self, "_cast_dtype")
                 streamer.bind(
                     shared,
                     idx,
@@ -394,9 +399,10 @@ class StreamingLTXModel(nn.Module):
                     cast_dtype=cast_dtype,
                 )
                 prev_idx[0] = idx
-                # The compiled block was traced with ``cast_dtype`` as the compute
-                # dtype; once the overflow guard drops it, run the eager block.
+                # The compiled block is traced for the current compute dtype; run the
+                # eager block if the two ever disagree.
                 traced = inner.compute_dtype is cast_dtype
+                compiled = object.__getattribute__(self, "_compiled_block")
                 return compiled if use_compiled and traced else shared
 
             kwargs["block_provider"] = provider

@@ -220,6 +220,39 @@ def test_inplace_lora_fusion_is_recast_to_the_compute_dtype():
     assert model.transformer_blocks[0].attn1(mx.random.normal((1, 8, dim))).dtype == mx.float16
 
 
+def test_two_stage_distilled_lora_fusion_is_recast(tmp_path):
+    """Stage 2 of the dev-model pipelines fuses the distilled LoRA in place: it must stay float16."""
+    from types import SimpleNamespace
+
+    from ltx_pipelines_mlx._base import BasePipeline
+    from ltx_pipelines_mlx.ti2vid_two_stages import TI2VidTwoStagesPipeline
+
+    model = _model()
+    model.set_compute_dtype(mx.float16)
+    dim = model.config.video_dim
+    key = "transformer_blocks.0.attn1.to_q"
+    mx.save_safetensors(
+        str(tmp_path / "distilled-lora.safetensors"),
+        {
+            f"{key}.lora_A.weight": 0.01 * mx.random.normal((4, dim)),
+            f"{key}.lora_B.weight": 0.01 * mx.random.normal((dim, 4)),
+        },
+    )
+    pipe = SimpleNamespace(
+        low_ram_streaming=False,
+        model_dir=tmp_path,
+        dit=model,
+        _distilled_lora="distilled-lora.safetensors",
+        _distilled_lora_strength=1.0,
+        _resolve_safetensors=BasePipeline._resolve_safetensors,
+    )
+    pipe._recast_after_inplace_fusion = lambda dit=None: BasePipeline._recast_after_inplace_fusion(pipe, dit)
+
+    TI2VidTwoStagesPipeline._fuse_distilled_lora(pipe, model)  # the call site used by two-stage, hq, a2v, keyframe
+    assert model.transformer_blocks[0].attn1.to_q.scales.dtype == mx.float16
+    assert model.transformer_blocks[0].attn1(mx.random.normal((1, 8, dim))).dtype == mx.float16
+
+
 def _save_blocks(model: LTXModel, path: Path) -> None:
     flat = {}
     for i, block in enumerate(model.transformer_blocks):
@@ -245,6 +278,50 @@ def test_streamed_model_matches_resident_model():
         assert streamed.compute_dtype == mx.float16
         assert _rel_err(v, ref_v) < 1e-5
         assert _rel_err(a, ref_a) < 1e-5
+
+
+def test_streamed_overflow_guard_drops_the_setting_on_the_wrapper(capsys):
+    def overflowing(seed=0):
+        m = _model(seed)
+        ff = m.transformer_blocks[0].ff.proj_out
+        ff.scales = ff.scales * 5e5  # finite in float32, past float16's 65504 inside the feed-forward
+        mx.eval(m.parameters())
+        return m
+
+    reference = overflowing()  # no compute dtype: the default path
+    inputs = _inputs(reference.config)
+    ref_v, ref_a = reference(**inputs)
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "blocks.safetensors"
+        _save_blocks(overflowing(), path)
+        inner = _model()
+        inner.transformer_blocks = [inner.transformer_blocks[0]]
+        streamer = BlockStreamer(path, block_prefix="transformer_blocks.")
+        bound_dtypes = []
+        bind = streamer.bind
+
+        def spy(block, idx, **kw):
+            bound_dtypes.append(kw.get("cast_dtype"))
+            return bind(block, idx, **kw)
+
+        streamer.bind = spy
+        streamed = StreamingLTXModel(inner, streamer)
+        streamed.set_compute_dtype(mx.float16)
+
+        v, a = streamed(**inputs)
+        assert "not finite" in capsys.readouterr().err
+        n = reference.config.num_layers
+        assert bound_dtypes == [mx.float16] * n + [None] * n  # the recompute binds uncast weights
+        # Dropped on the wrapper too: later binds stop casting and the compiled block is used again.
+        assert object.__getattribute__(streamed, "_cast_dtype") is None
+        assert inner.compute_dtype is None
+        # The recompute rebinds the stored weights, so it is the default path, not float16-rounded.
+        assert _rel_err(v, ref_v) < 1e-5 and _rel_err(a, ref_a) < 1e-5
+
+        v2, _ = streamed(**inputs)
+        assert "not finite" not in capsys.readouterr().err
+        assert _rel_err(v2, ref_v) < 1e-5
 
 
 @pytest.mark.parametrize(

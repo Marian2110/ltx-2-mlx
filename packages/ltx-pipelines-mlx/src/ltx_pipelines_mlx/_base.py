@@ -535,16 +535,20 @@ class BasePipeline:
             aggressive_cleanup()
             return apply_compute_dtype_from_env(dit)
 
-    def _recast_after_inplace_fusion(self) -> None:
+    def _recast_after_inplace_fusion(self, dit: LTXModel | None = None) -> None:
         """Re-apply the DiT's compute dtype after weights were fused in place.
 
         LoRA fusion re-quantizes from a float32 weight, so the new scales/biases
         come out float32; with a compute dtype set they must be cast again, or
         every fused layer silently runs ``quantized_matmul`` in float32.
+
+        Args:
+            dit: The transformer that was fused (defaults to ``self.dit``).
         """
-        dtype = getattr(self.dit, "compute_dtype", None)
-        if self.dit is not None and dtype is not None:
-            self.dit.set_compute_dtype(dtype)
+        dit = self.dit if dit is None else dit
+        dtype = getattr(dit, "compute_dtype", None)
+        if dit is not None and dtype is not None:
+            dit.set_compute_dtype(dtype)
 
     def _stepwise_hook(
         self,

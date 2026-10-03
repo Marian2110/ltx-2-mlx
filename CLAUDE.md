@@ -1428,10 +1428,12 @@ and the float32 gate multiply promotes each module output back before the residu
 float parameters (quantization scales/biases, Linear biases, q/k norm weights) are cast at load:
 float16 activations against bf16 scales would promote to float32 inside `quantized_matmul` and gain
 nothing. The AdaLN tables keep their F32 dtype. `bfloat16` gives the upstream precision; unset or
-`float32` is today's path, untouched. In-place LoRA fusion (`dfr`'s detailing LoRA, `ic-lora`)
-re-quantizes from a float32 weight, so its new scales come out float32; those pipelines call
-`BasePipeline._recast_after_inplace_fusion()` afterwards, otherwise every fused layer would quietly run
-in float32 again.
+`float32` is today's path, untouched. In-place LoRA fusion (`dfr`'s detailing LoRA, `ic-lora`, and the
+distilled-LoRA fusion that starts stage 2 of `--two-stage`, `--two-stages-hq`, `a2v` and `keyframe`
+in `TI2VidTwoStagesPipeline._fuse_distilled_lora`) re-quantizes from a float32 weight, so its new scales
+come out float32; every such call site calls `BasePipeline._recast_after_inplace_fusion()` afterwards,
+otherwise every fused layer would quietly run in float32 again. (`--low-ram` swaps the streamer to the
+pre-fused distilled transformer instead and keeps casting at bind time.)
 
 Why float16: on an M1 GPU (no native bf16), int8 `quantized_matmul` at the stage-2 shapes
 (17,856 tokens × 4096) runs at 6.6 TFLOPS with float32 activations, 5.8 with bf16 and 8.1 with
@@ -1448,15 +1450,19 @@ Float16 margin: on every forward of two full renders (I2V 576×1024×121 and a f
 1024×576×97, all 11 forwards each) the largest value inside any attention/FF op was 2,512, against
 float16's 65,504; the residual stream reaches ~14,000, which is why it stays float32. As a guard,
 `LTXModel.__call__` checks the output when a compute dtype is set and, if it is not finite, prints
-a warning, drops the setting for the rest of the run and recomputes that forward (`--low-ram`
-switches to the eager block for it, since the compiled block was traced with the old dtype).
+a warning, drops the setting for the rest of the run and recomputes that forward. On a resident model
+the recompute is **not** the float32 path: the parameters already cast stay float16-rounded, only the
+activations are no longer cast. Under `--low-ram` the `StreamingLTXModel` wrapper owns the setting (the
+inner model holds a weak reference to it), so the guard drops it there: later binds stop casting, the
+compiled block is retraced, and the recompute rebinds the stored weights, i.e. it is the default path.
 0.48 % of the q8 pack's quantization scales are below float16's normal range (they belong to
 near-zero weight groups) and lose precision in the cast.
 
 Tests: `tests/test_compute_dtype.py` (tiny int8 model with F32 tables and per-token timesteps, the
 production dtype layout): default untouched, which parameters are cast, module output dtypes,
-closeness to float32 with float16 closer than bf16, the overflow guard, streaming parity, the recast
-after in-place LoRA fusion, env parsing.
+closeness to float32 with float16 closer than bf16, the overflow guard (resident and streamed), streaming
+parity, the recast after in-place LoRA fusion (including the two-stage distilled-LoRA call site), env
+parsing.
 
 ### `LTX2_GEMMA_MAX_LENGTH`
 

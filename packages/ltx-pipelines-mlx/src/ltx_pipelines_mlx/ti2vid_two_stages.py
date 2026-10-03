@@ -202,6 +202,8 @@ class TI2VidTwoStagesPipeline(BasePipeline):
 
         fused = apply_loras(model_sd, [lora_with_strength])
         dit.load_weights(list(fused.sd.items()))
+        # The fusion re-quantizes from float32, so stage 2 would run float32 scales otherwise.
+        self._recast_after_inplace_fusion(dit)
         aggressive_cleanup()
 
     def _swap_to_distilled_streamer(self) -> None:

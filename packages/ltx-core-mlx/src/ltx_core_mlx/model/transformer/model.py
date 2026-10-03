@@ -604,7 +604,10 @@ class LTXModel(nn.Module):
 
         Overflow guard: a forward whose output is not finite is recomputed without
         the setting, which is then dropped for the rest of the run. ``None`` stops
-        casting activations; parameters already cast keep their new dtype.
+        casting activations; parameters already cast keep their new dtype, so on a
+        resident model the recompute uses float16-rounded parameters with
+        full-precision activations (not the float32 path). A streamed model rebinds
+        its stored weights instead.
         """
         for block in self.transformer_blocks:
             block.set_compute_dtype(dtype)
@@ -1028,10 +1031,16 @@ class LTXModel(nn.Module):
         if call_args is not None and not _all_finite(video_out, audio_out):
             print(
                 f"warning: DiT output is not finite with compute dtype {self._compute_dtype}; "
-                "recomputing this step and running the rest of the generation without it",
+                "recomputing this step and running the rest of the generation without it. "
+                "A resident model keeps the parameters already cast, so this is not the full-precision "
+                "path; a streamed model rebinds its stored weights.",
                 file=sys.stderr,
             )
-            self.set_compute_dtype(None)
+            # A StreamingLTXModel owns the setting (it casts each block as it binds it): drop it
+            # there so later binds stop casting and the compiled block is retraced.
+            owner_ref = getattr(self, "_compute_dtype_owner", None)
+            owner = owner_ref() if owner_ref is not None else None
+            (owner if owner is not None else self).set_compute_dtype(None)
             return self(**call_args)
 
         return video_out, audio_out
