@@ -19,6 +19,7 @@ import mlx.core as mx
 
 from ltx_core_mlx.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
 from ltx_core_mlx.conditioning.types.latent_cond import LatentState
+from ltx_core_mlx.loader.lora_adapters import lora_mode_from_env
 from ltx_core_mlx.model.audio_vae.audio_vae import AudioVAEDecoder
 from ltx_core_mlx.model.audio_vae.bwe import VocoderWithBWE
 from ltx_core_mlx.model.transformer.model import LTXModel, LTXModelConfig, compute_dtype_from_env
@@ -64,6 +65,29 @@ def apply_compute_dtype_from_env(dit: LTXModel) -> LTXModel:
     if dtype is not None:
         dit.set_compute_dtype(dtype)
     return dit
+
+
+def unfused_loras_requested(low_ram_streaming: bool) -> bool:
+    """Whether ``LTX2_LORA_MODE=unfused`` applies to a DiT loaded with ``low_ram_streaming``.
+
+    ``--low-ram`` keeps fusing each block's LoRAs as the block is bound (the fused copy is thrown away
+    after the block runs), so the setting only changes resident models; a note says so.
+
+    Args:
+        low_ram_streaming: Whether the pipeline streams the DiT blocks.
+
+    Returns:
+        ``True`` when LoRAs should be attached as run-time adapters instead of fused.
+    """
+    if lora_mode_from_env() != "unfused":
+        return False
+    if low_ram_streaming:
+        print(
+            "note: LTX2_LORA_MODE=unfused does not apply under --low-ram; LoRAs are fused per block at bind",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def reject_negative_prompt(negative_prompt: str | None, pipeline_name: str) -> None:
@@ -485,7 +509,9 @@ class BasePipeline:
         The single entry point for DiT construction across every pipeline's
         ``load()``. Routes through :func:`utils._orchestration.load_transformer`
         when no LoRAs are pending, or fuses LoRA deltas into the weight dict
-        before quantization when ``self._pending_loras`` is set by the CLI.
+        before quantization when ``self._pending_loras`` is set by the CLI
+        (with ``LTX2_LORA_MODE=unfused``: loads the model as is and attaches
+        the LoRAs as run-time adapters, see :func:`ltx_core_mlx.loader.attach_loras`).
 
         In ``low_ram_streaming`` mode, LoRAs are attached as
         :class:`BlockLoraSource` objects on the :class:`StreamingLTXModel`
@@ -523,6 +549,15 @@ class BasePipeline:
                     )
                 object.__setattr__(model, "_lora_sources", sources)
                 return apply_compute_dtype_from_env(model)
+
+            if unfused_loras_requested(self.low_ram_streaming):
+                from ltx_pipelines_mlx.utils._orchestration import attach_pending_loras
+                from ltx_pipelines_mlx.utils._orchestration import load_transformer as _load_impl
+
+                dit = _load_impl(transformer_path, low_ram_streaming=False)
+                # Nothing detaches user LoRAs, so the handle is dropped (a reload starts clean).
+                attach_pending_loras(dit, pending_loras)
+                return apply_compute_dtype_from_env(dit)
 
             transformer_weights = load_split_safetensors(transformer_path, prefix="transformer.")
             transformer_weights = self._fuse_pending_loras(transformer_weights, pending_loras)

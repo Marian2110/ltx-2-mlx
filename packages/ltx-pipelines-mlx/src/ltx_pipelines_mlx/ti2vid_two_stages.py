@@ -175,6 +175,13 @@ class TI2VidTwoStagesPipeline(BasePipeline):
         materialize the full transformer (defeating streaming). Instead
         we swap to the pre-fused ``transformer-distilled.safetensors``
         produced by mlx-forge — equivalent at default LoRA strength.
+
+        Always fused, also with ``LTX2_LORA_MODE=unfused``: the distilled LoRA has
+        rank 384 (2.3) / 450 (2.5) on every block linear (plus, on 2.5, the AdaLN
+        and projection layers), so as adapters it would stay resident and add work
+        to every stage-2 forward. LoRAs already attached as adapters (``--lora``
+        under ``unfused``) keep the weight names, so this fusion still reaches the
+        layers they wrap.
         """
         if self.low_ram_streaming:
             self._swap_to_distilled_streamer()

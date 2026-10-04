@@ -56,6 +56,7 @@ packages/
 │       │   ├── block_streaming.py         # BlockStreamer, StreamingLTXModel (--low-ram)
 │       │   ├── helpers.py                 # Checkpoint metadata (version parser)
 │       │   ├── fuse_loras.py              # LoRA weight fusion
+│       │   ├── lora_adapters.py           # Unfused LoRAs: run-time adapters (LTX2_LORA_MODE=unfused)
 │       │   ├── primitives.py              # Loading primitives
 │       │   ├── sd_ops.py                  # Safetensors loading operations
 │       │   └── sft_loader.py              # Split safetensors loader
@@ -1539,6 +1540,46 @@ production dtype layout): default untouched, which parameters are cast, module o
 closeness to float32 with float16 closer than bf16, the overflow guard (resident and streamed), streaming
 parity, the recast after in-place LoRA fusion (including the two-stage distilled-LoRA call site), env
 parsing.
+
+### LoRA mode (`LTX2_LORA_MODE`)
+
+On a quantized pack, fusing a LoRA in place (`apply_loras`) dequantizes each targeted weight, adds
+`strength * B @ A` and re-quantizes to the pack's int8 / group 64 (or int4). The re-quantization
+error is of the same order as a small LoRA's update. Measured on the LTX-2.5 Ingredients IC-LoRA: the
+update is 0.25-3.6 % of the weight's norm and the error 16-216 % of the update itself; on the detailing
+LoRA at strength 0.5, three layers: 82 %, 36 % and 194 %. Most of what such a LoRA should change is lost.
+
+`LTX2_LORA_MODE=unfused` (Python: `ltx_core_mlx.loader.attach_loras`) leaves the weights alone and
+turns every targeted linear into an adapter that computes `base(x) + (x @ A^T) @ B^T` (strength
+folded into `B` in float32; the ranks of several LoRAs on one layer are stacked). The adapter is the
+original layer with `lora_a` / `lora_b` added (its class subclasses the layer's class and shares its
+arrays), so the weight names do not change: an in-place fusion that runs later still reaches the
+weight under an adapter, and `LTXModel.set_compute_dtype` casts the factors with the other float
+parameters of their attention / feed-forward module. The factors are created in the DiT's compute
+dtype when one is set (no `_recast_after_inplace_fusion` is needed: no weight was re-quantized), else
+kept in the LoRA file's dtype, which the float32 activations promote. `AttachedLoras.detach()` puts
+the original module objects back in place, with the same arrays. The handle holds no model memory (weak
+references; the replaced layers it keeps are emptied while the adapter holds their parameters), so a
+pipeline that frees its DiT with LoRAs attached really frees it. Unset or `fused` is today's path,
+untouched.
+
+| call site | unfused | notes |
+|---|---|---|
+| `ic-lora` / `hdr-ic-lora` / `lipdub` task LoRAs (`ICLoraPipeline._fuse_loras`) | adapters | Stage 2 of the legacy distilled path detaches them in place instead of reloading the DiT; a second call replaces them |
+| `--dfr` detailing LoRA (`DFRPipeline._attach_detailing_lora`) | adapters | the temporal rounds detach them in place (no DiT reload); the spatial epilogue re-attaches |
+| `generate --lora` on a resident DiT (`_pending_loras`) | adapters | the DiT is loaded as usual, then the LoRAs are attached |
+| distilled LoRA (stage 2 of `--two-stage`, `--two-stages-hq`, `a2v`, `keyframe`; `ic-lora` dev mode) | **fused** | rank 384 / 450 on every block linear: as adapters it would stay resident and add work to every forward |
+| `--low-ram` (any LoRA) | **fused per block at bind** | the fused copy is thrown away after each block runs; a note is printed |
+
+Cost: per adapted layer, `rank * (in + out)` multiply-adds per token against `in * out` for the layer
+(rank 128 on a 4096 x 4096 projection: +6 %; on the 4096 x 16384 feed-forward: +4 %), and the factors
+stay resident (the LoRA file's size, e.g. 1.3 GB for a rank-128 IC-LoRA in bf16).
+
+Tests: `tests/test_unfused_lora.py` (adapter vs dense `W + B @ A`; on a q8 layer and on the tiny q8
+DiT, fuse + re-quantize vs unfused against a float32 reference; stacking and reverse-order detach;
+detach restores the original objects and the exact output; a freed model is not kept alive; weight
+names unchanged; compute dtype followed; an in-place fusion still reaches an adapted layer; the
+ic-lora / dfr / `--lora` call sites; the default path identical to the fusion; env parsing).
 
 ### `LTX2_GEMMA_MAX_LENGTH`
 

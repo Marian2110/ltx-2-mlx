@@ -25,10 +25,12 @@ from ltx_core_mlx.components.patchifiers import (
 from ltx_core_mlx.loader import (
     LTXV_LORA_BLOCK_PREFIX,
     LTXV_LORA_COMFY_RENAMING_MAP,
+    AttachedLoras,
     LoraStateDictWithStrength,
     SafetensorsStateDictLoader,
     StateDict,
     apply_loras,
+    attach_loras,
 )
 from ltx_core_mlx.model.transformer.model import X0Model
 from ltx_core_mlx.model.upsampler import LatentUpsampler
@@ -36,7 +38,7 @@ from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_token_count, compute_video_positions
 from ltx_core_mlx.utils.video import load_video_frames_normalized
 from ltx_core_mlx.utils.weights import apply_quantization, load_split_safetensors
-from ltx_pipelines_mlx._base import BasePipeline
+from ltx_pipelines_mlx._base import BasePipeline, unfused_loras_requested
 from ltx_pipelines_mlx.iclora_utils import (
     append_ic_lora_reference_video_conditionings,
     read_lora_reference_downscale_factor,
@@ -86,6 +88,8 @@ class ICLoraPipeline(BasePipeline):
 
         # Resolve LoRA paths (download from HuggingFace if needed)
         self._lora_paths = [(_resolve_lora_path(p), s) for p, s in (lora_paths or [])]
+        # Task LoRAs attached as run-time adapters (LTX2_LORA_MODE=unfused), detached in place.
+        self._lora_adapters: AttachedLoras | None = None
 
         # Read reference downscale factor from LoRA metadata.
         # IC-LoRAs trained with low-resolution reference videos store this factor
@@ -196,12 +200,30 @@ class ICLoraPipeline(BasePipeline):
         In dev mode the distilled LoRA is fused alongside the task IC-LoRA
         (see :meth:`_effective_lora_paths`); LoRA deltas are additive, so
         fusing them together in one pass is order-independent.
+
+        ``LTX2_LORA_MODE=unfused`` (resident model): the task IC-LoRAs are
+        attached as run-time adapters instead, so their small deltas are not
+        lost to the re-quantization; the distilled LoRA of dev mode is still
+        fused (rank 384 on 2.3, 450 on 2.5, on every block linear: unfused it
+        would stay resident and add work to every forward).
         """
         lora_paths = self._effective_lora_paths()
         if not lora_paths:
             return
 
         assert self.dit is not None
+
+        if unfused_loras_requested(self.low_ram_streaming):
+            self._detach_lora_adapters()  # a second call replaces the adapters instead of stacking them
+            task_paths = list(self._lora_paths)
+            distilled_paths = lora_paths[len(task_paths) :]  # _effective_lora_paths appends it last
+            if distilled_paths:
+                self._fuse_lora_paths_in_place(distilled_paths)
+            if task_paths:
+                self._lora_adapters = attach_loras(self.dit, self._load_lora_sds(task_paths))
+                aggressive_cleanup()
+                logger.info(f"Attached {len(task_paths)} LoRA(s) to {len(self._lora_adapters)} layers (unfused)")
+            return
 
         if self.low_ram_streaming:
             from ltx_core_mlx.loader.block_streaming import BlockLoraSource
@@ -220,17 +242,28 @@ class ICLoraPipeline(BasePipeline):
             object.__setattr__(self.dit, "_lora_sources", sources)
             return
 
-        import mlx.utils
+        self._fuse_lora_paths_in_place(lora_paths)
 
-        model_weights = dict(mlx.utils.tree_flatten(self.dit.parameters()))
-        model_sd = StateDict(sd=model_weights, size=0, dtype=set())
-
+    @staticmethod
+    def _load_lora_sds(lora_paths: list[tuple[str, float]]) -> list[LoraStateDictWithStrength]:
+        """Read LoRA files with the ComfyUI key renaming, paired with their strengths."""
         loader = SafetensorsStateDictLoader()
         lora_sds = []
         for lora_path, strength in lora_paths:
             lora_sd = loader.load(lora_path, sd_ops=LTXV_LORA_COMFY_RENAMING_MAP)
             lora_sds.append(LoraStateDictWithStrength(state_dict=lora_sd, strength=strength))
             logger.info(f"Loaded LoRA: {lora_path} (strength={strength})")
+        return lora_sds
+
+    def _fuse_lora_paths_in_place(self, lora_paths: list[tuple[str, float]]) -> None:
+        """Fuse LoRAs into the resident transformer's weights and re-quantize."""
+        import mlx.utils
+
+        assert self.dit is not None
+        model_weights = dict(mlx.utils.tree_flatten(self.dit.parameters()))
+        model_sd = StateDict(sd=model_weights, size=0, dtype=set())
+
+        lora_sds = self._load_lora_sds(lora_paths)
 
         fused_sd = apply_loras(model_sd=model_sd, lora_sd_and_strengths=lora_sds)
 
@@ -240,6 +273,21 @@ class ICLoraPipeline(BasePipeline):
         aggressive_cleanup()
 
         logger.info(f"Fused {len(lora_paths)} LoRA(s) into transformer")
+
+    def _detach_lora_adapters(self) -> bool:
+        """Remove the unfused task LoRAs from the transformer, in place.
+
+        Returns:
+            ``True`` if adapters were attached and the resident transformer is now clean of them
+            (``False`` when nothing was attached, or the transformer has been freed since).
+        """
+        adapters = getattr(self, "_lora_adapters", None)
+        if adapters is None:
+            return False
+        adapters.detach()
+        self._lora_adapters = None
+        aggressive_cleanup()
+        return self.dit is not None
 
     def _reload_clean_transformer(self) -> None:
         """Reload the transformer without LoRA for Stage 2.
@@ -254,7 +302,13 @@ class ICLoraPipeline(BasePipeline):
 
         Only used in the legacy distilled (non-dev) path. In dev mode both
         LoRAs are retained across stages, so this is not called.
+
+        With unfused LoRAs (``LTX2_LORA_MODE=unfused``) the weights were never
+        changed, so the adapters are removed in place and nothing is reloaded.
         """
+        if self._detach_lora_adapters():
+            logger.info("Detached unfused LoRAs for Stage 2 (no reload)")
+            return
         if self.low_ram_streaming and self.dit is not None:
             old_sources = list(object.__getattribute__(self.dit, "_lora_sources"))
             object.__setattr__(self.dit, "_lora_sources", [])

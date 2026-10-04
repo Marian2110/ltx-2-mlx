@@ -46,10 +46,12 @@ from ltx_core_mlx.conditioning.types.latent_cond import VideoConditionByLatentIn
 from ltx_core_mlx.loader import (
     LTXV_LORA_BLOCK_PREFIX,
     LTXV_LORA_COMFY_RENAMING_MAP,
+    AttachedLoras,
     LoraStateDictWithStrength,
     SafetensorsStateDictLoader,
     StateDict,
     apply_loras,
+    attach_loras,
 )
 from ltx_core_mlx.loader.block_streaming import BlockLoraSource
 from ltx_core_mlx.model.upsampler import LatentUpsampler
@@ -58,7 +60,7 @@ from ltx_core_mlx.model.video_vae.tiling import DimensionTilingConfig, TileCount
 from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_token_count, compute_video_positions
 from ltx_core_mlx.utils.weights import apply_quantization
-from ltx_pipelines_mlx._base import reject_negative_prompt
+from ltx_pipelines_mlx._base import reject_negative_prompt, unfused_loras_requested
 from ltx_pipelines_mlx.dfr_layout import (
     TemporalTilePlan,
     TilePrefix,
@@ -423,6 +425,8 @@ class DFRPipeline(DistilledPipeline):
         self._detailing_lora_path: str | None = None
         self._detailing_downscale: int | None = None
         self._detailing_source: BlockLoraSource | None = None
+        # LTX2_LORA_MODE=unfused: the detailing LoRA as run-time adapters, detached in place.
+        self._detailing_adapters: AttachedLoras | None = None
         self.canvas_frames: int = 0
         self.generated_keyframe_positions: list[int] = []
         self.temporal_upscalings = temporal_upscalings
@@ -452,14 +456,34 @@ class DFRPipeline(DistilledPipeline):
         """Attach the detailing LoRA at ``DETAILING_LORA_STRENGTH`` to the resident distilled DiT.
 
         Streaming (``--low-ram``): append a :class:`BlockLoraSource` (fused at each block bind,
-        exactly like ``ICLoraPipeline._fuse_loras``). Otherwise fuse in place and re-quantize:
-        stage 1 is finished and the model is reused clean only by the temporal rounds, which
-        reload it (see :meth:`_detach_detailing_lora`); the spatial epilogue then re-attaches the
-        LoRA onto that clean model.
+        exactly like ``ICLoraPipeline._fuse_loras``). ``LTX2_LORA_MODE=unfused``: attach it as
+        run-time adapters (:func:`~ltx_core_mlx.loader.attach_loras`), which the temporal rounds
+        detach in place. Otherwise fuse in place and re-quantize: stage 1 is finished and the
+        model is reused clean only by the temporal rounds, which reload it (see
+        :meth:`_detach_detailing_lora`); the spatial epilogue then re-attaches the LoRA onto that
+        clean model.
         """
         assert self.dit is not None
         path = self._resolve_detailing_lora()
         with phase("Attaching the detailing IC-LoRA (strength 0.5)", verbose=self.verbose):
+            if unfused_loras_requested(self.low_ram_streaming):
+                if self._detailing_adapters is not None:  # never stack the same LoRA twice
+                    self._detailing_adapters.detach()
+                lora_sd = SafetensorsStateDictLoader().load(path, sd_ops=LTXV_LORA_COMFY_RENAMING_MAP)
+                # Created in the DiT's compute dtype; the base weights are untouched, so no recast.
+                self._detailing_adapters = attach_loras(
+                    self.dit,
+                    [LoraStateDictWithStrength(state_dict=lora_sd, strength=DETAILING_LORA_STRENGTH)],
+                )
+                del lora_sd
+                aggressive_cleanup()
+                logger.info(
+                    "Attached detailing LoRA (unfused, %d layers): %s (strength=%s)",
+                    len(self._detailing_adapters),
+                    path,
+                    DETAILING_LORA_STRENGTH,
+                )
+                return
             if self.low_ram_streaming:
                 sources: list = list(object.__getattribute__(self.dit, "_lora_sources"))
                 source = BlockLoraSource(
@@ -496,10 +520,18 @@ class DFRPipeline(DistilledPipeline):
     def _detach_detailing_lora(self) -> None:
         """Give the temporal rounds the distilled transformer without the detailing IC-LoRA (upstream ``self.stage``).
 
-        Streaming: drop the detailing :class:`BlockLoraSource` (user LoRAs stay). Otherwise the LoRA is fused
-        into the weights, so free the fused DiT and reload a clean one; pending user LoRAs are re-fused by
-        :meth:`_load_transformer_with_optional_streaming`.
+        Streaming: drop the detailing :class:`BlockLoraSource` (user LoRAs stay). Unfused
+        (``LTX2_LORA_MODE=unfused``): detach its adapters in place, no reload (user LoRAs stay). Otherwise the
+        LoRA is fused into the weights, so free the fused DiT and reload a clean one; pending user LoRAs are
+        re-fused by :meth:`_load_transformer_with_optional_streaming`.
         """
+        if self._detailing_adapters is not None:
+            self._detailing_adapters.detach()
+            self._detailing_adapters = None
+            aggressive_cleanup()
+            if self.dit is not None:
+                logger.info("Detached the detailing LoRA in place (no DiT reload)")
+                return
         if self.low_ram_streaming:
             sources = [s for s in object.__getattribute__(self.dit, "_lora_sources") if s is not self._detailing_source]
             object.__setattr__(self.dit, "_lora_sources", sources)

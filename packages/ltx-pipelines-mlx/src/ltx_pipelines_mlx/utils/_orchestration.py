@@ -29,6 +29,7 @@ from ltx_core_mlx.utils.weights import (
 )
 
 if TYPE_CHECKING:
+    from ltx_core_mlx.loader.lora_adapters import AttachedLoras
     from ltx_core_mlx.model.video_vae.diffusion_decoder.keyframes import DecodeKeyframes
     from ltx_pipelines_mlx.utils.blocks import AudioDecoder, VideoDecoder
 
@@ -88,6 +89,34 @@ def fuse_pending_loras(
 
     fused_sd = apply_loras(model_sd=model_sd, lora_sd_and_strengths=lora_sds)
     return fused_sd.sd
+
+
+def attach_pending_loras(
+    dit: LTXModel,
+    lora_paths: list[tuple[str, float]],
+) -> AttachedLoras:
+    """Attach LoRAs to a loaded transformer as run-time adapters (``LTX2_LORA_MODE=unfused``).
+
+    The unfused counterpart of :func:`fuse_pending_loras`: same files, same key renaming, but the
+    weights are left as loaded and every targeted layer adds ``(x @ A^T) @ B^T`` at run time.
+    """
+    from ltx_core_mlx.loader.lora_adapters import attach_loras
+    from ltx_core_mlx.loader.primitives import LoraStateDictWithStrength
+    from ltx_core_mlx.loader.sd_ops import LTXV_LORA_COMFY_RENAMING_MAP
+    from ltx_core_mlx.loader.sft_loader import SafetensorsStateDictLoader
+
+    loader = SafetensorsStateDictLoader()
+    lora_sds = []
+    for lora_path, strength in lora_paths:
+        resolved = resolve_lora_path(lora_path)
+        lora_sd = loader.load(resolved, sd_ops=LTXV_LORA_COMFY_RENAMING_MAP)
+        lora_sds.append(LoraStateDictWithStrength(state_dict=lora_sd, strength=strength))
+        print(f"  Attaching LoRA (unfused): {lora_path} (strength={strength:.2f})", file=sys.stderr)
+
+    handle = attach_loras(dit, lora_sds)
+    del lora_sds
+    aggressive_cleanup()
+    return handle
 
 
 def load_transformer(
@@ -301,6 +330,7 @@ def combined_image_conditionings(
 
 
 __all__ = [
+    "attach_pending_loras",
     "combined_image_conditionings",
     "decode_and_save_video",
     "fuse_pending_loras",
