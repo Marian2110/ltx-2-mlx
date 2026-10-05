@@ -28,6 +28,7 @@ def pipeline_stub():
     class _Stub:
         verbose = False
         low_ram_streaming = False
+        lora_mode = "fused"  # parsed from LTX2_LORA_MODE by BasePipeline.__init__
 
         def _fuse_pending_loras(self, weights, pending):
             # Spy: record the call, return a tagged dict so we can assert

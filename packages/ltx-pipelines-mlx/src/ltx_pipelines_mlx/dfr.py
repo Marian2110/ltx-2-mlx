@@ -466,7 +466,7 @@ class DFRPipeline(DistilledPipeline):
         assert self.dit is not None
         path = self._resolve_detailing_lora()
         with phase("Attaching the detailing IC-LoRA (strength 0.5)", verbose=self.verbose):
-            if unfused_loras_requested(self.low_ram_streaming):
+            if unfused_loras_requested(self.lora_mode, self.low_ram_streaming):
                 if self._detailing_adapters is not None:  # never stack the same LoRA twice
                     self._detailing_adapters.detach()
                 lora_sd = SafetensorsStateDictLoader().load(path, sd_ops=LTXV_LORA_COMFY_RENAMING_MAP)

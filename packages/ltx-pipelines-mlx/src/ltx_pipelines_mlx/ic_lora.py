@@ -213,7 +213,7 @@ class ICLoraPipeline(BasePipeline):
 
         assert self.dit is not None
 
-        if unfused_loras_requested(self.low_ram_streaming):
+        if unfused_loras_requested(self.lora_mode, self.low_ram_streaming):
             self._detach_lora_adapters()  # a second call replaces the adapters instead of stacking them
             task_paths = list(self._lora_paths)
             distilled_paths = lora_paths[len(task_paths) :]  # _effective_lora_paths appends it last

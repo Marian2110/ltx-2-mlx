@@ -383,12 +383,12 @@ def test_dfr_unfused_attach_and_in_place_detach(tmp_path, monkeypatch):
     _write_25_pack(tmp_path)
     model = _model()
     lora_path = _save_lora(model, tmp_path)
+    monkeypatch.setenv("LTX2_LORA_MODE", "unfused")  # read when the pipeline is built
     pipe = dfr_mod.DFRPipeline(str(tmp_path), low_memory=False, detailing_lora=lora_path)
     pipe.dit = model  # type: ignore[assignment]
     pipe._detailing_lora_path = lora_path
     originals = {p: _resolve(model, p) for p in _ADAPTED}
     weights = {p: originals[p].weight for p in _ADAPTED}
-    monkeypatch.setenv("LTX2_LORA_MODE", "unfused")
     monkeypatch.setattr(dfr_mod, "apply_loras", _no_fusion)
     monkeypatch.setattr(pipe, "_load_transformer_with_optional_streaming", _no_fusion)
 
@@ -414,12 +414,12 @@ def test_dfr_unfused_is_ignored_under_low_ram(tmp_path, monkeypatch, capsys):
     from tests.test_dfr import _write_25_pack
 
     _write_25_pack(tmp_path)
+    monkeypatch.setenv("LTX2_LORA_MODE", "unfused")
     pipe = dfr_mod.DFRPipeline(
         str(tmp_path), low_memory=False, low_ram_streaming=True, detailing_lora=str(tmp_path / "detail.safetensors")
     )
     pipe.dit = SimpleNamespace(_lora_sources=[])  # type: ignore[assignment]
     made = []
-    monkeypatch.setenv("LTX2_LORA_MODE", "unfused")
     monkeypatch.setattr(dfr_mod, "BlockLoraSource", lambda path, **kw: made.append(path) or ("src", path))
     pipe._attach_detailing_lora()
     assert made == [str(tmp_path / "detail.safetensors")]
@@ -427,10 +427,11 @@ def test_dfr_unfused_is_ignored_under_low_ram(tmp_path, monkeypatch, capsys):
     assert "does not apply under --low-ram" in capsys.readouterr().err
 
 
-def _ic_pipe(tmp_path, model, lora_paths, *, dev_mode=False, distilled=None):
+def _ic_pipe(tmp_path, model, lora_paths, *, dev_mode=False, distilled=None, lora_mode="fused"):
     from ltx_pipelines_mlx.ic_lora import ICLoraPipeline
 
     pipe = object.__new__(ICLoraPipeline)
+    pipe.lora_mode = lora_mode  # what BasePipeline.__init__ parses from LTX2_LORA_MODE
     pipe.model_dir = tmp_path
     pipe.dev_mode = dev_mode
     pipe.distilled_lora_path = distilled
@@ -470,8 +471,7 @@ def test_ic_lora_unfused_attaches_and_reload_detaches_in_place(tmp_path, monkeyp
 
     model = _model()
     originals = {p: _resolve(model, p) for p in _ADAPTED}
-    pipe = _ic_pipe(tmp_path, model, [(_save_lora(model, tmp_path), 1.0)])
-    monkeypatch.setenv("LTX2_LORA_MODE", "unfused")
+    pipe = _ic_pipe(tmp_path, model, [(_save_lora(model, tmp_path), 1.0)], lora_mode="unfused")
     monkeypatch.setattr(ic_mod, "apply_loras", _no_fusion)
     monkeypatch.setattr(pipe, "_load_transformer_with_optional_streaming", _no_fusion, raising=False)
 
@@ -492,7 +492,7 @@ def test_ic_lora_dev_mode_still_fuses_the_distilled_lora(tmp_path, monkeypatch):
     model = _model()
     task = _save_lora(model, tmp_path, paths=_ADAPTED[:2], name="task.safetensors")
     distilled = _save_lora(model, tmp_path, paths=_ADAPTED[2:], name="distilled.safetensors", seed=9)
-    pipe = _ic_pipe(tmp_path, model, [(task, 1.0)], dev_mode=True, distilled=distilled)
+    pipe = _ic_pipe(tmp_path, model, [(task, 1.0)], dev_mode=True, distilled=distilled, lora_mode="unfused")
     pipe._recast_after_inplace_fusion = lambda dit=None: None
     fused_with: list = []
     real_apply = ic_mod.apply_loras
@@ -501,7 +501,6 @@ def test_ic_lora_dev_mode_still_fuses_the_distilled_lora(tmp_path, monkeypatch):
         fused_with.append([lsd.strength for lsd in kwargs["lora_sd_and_strengths"]])
         return real_apply(**kwargs)
 
-    monkeypatch.setenv("LTX2_LORA_MODE", "unfused")
     monkeypatch.setattr(ic_mod, "apply_loras", spy)
     pipe._fuse_loras()
     assert fused_with == [[0.5]]  # only the distilled LoRA, at its strength
@@ -518,9 +517,10 @@ def test_pending_loras_unfused_attach_after_a_plain_load(tmp_path, monkeypatch):
 
     model = _model()
     lora_path = _save_lora(model, tmp_path)
-    stub = SimpleNamespace(verbose=False, low_ram_streaming=False, _pending_loras=[(lora_path, 1.0)])
+    stub = SimpleNamespace(
+        verbose=False, low_ram_streaming=False, lora_mode="unfused", _pending_loras=[(lora_path, 1.0)]
+    )
     stub._fuse_pending_loras = _no_fusion
-    monkeypatch.setenv("LTX2_LORA_MODE", "unfused")
     monkeypatch.setenv("LTX2_COMPUTE_DTYPE", "float16")
     with patch("ltx_pipelines_mlx.utils._orchestration.load_transformer", return_value=model) as load:
         dit = BasePipeline._load_transformer_with_optional_streaming(stub, Path("/fake/transformer.safetensors"))
@@ -548,3 +548,41 @@ def _resolve(model, path):
     for part in path.split("."):
         node = node[int(part)] if part.isdigit() else node[part]
     return node
+
+
+@pytest.mark.parametrize("low_ram", [False, True])
+def test_a_bad_mode_fails_when_the_pipeline_is_built(tmp_path, monkeypatch, low_ram):
+    """A typo stops the run before any work, also under --low-ram, where no LoRA path reads the mode."""
+    import ltx_pipelines_mlx.dfr as dfr_mod
+    from tests.test_dfr import _write_25_pack
+
+    _write_25_pack(tmp_path)
+    monkeypatch.setenv("LTX2_LORA_MODE", "unfuse")
+    with pytest.raises(ValueError, match="LTX2_LORA_MODE"):
+        dfr_mod.DFRPipeline(
+            str(tmp_path),
+            low_memory=False,
+            low_ram_streaming=low_ram,
+            detailing_lora=str(tmp_path / "detail.safetensors"),
+        )
+
+
+def test_pending_loras_under_low_ram_keep_bind_fusion_and_say_so(tmp_path, monkeypatch, capsys):
+    """generate --lora --low-ram with unfused: BlockLoraSource as before, plus the note."""
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from ltx_pipelines_mlx._base import BasePipeline
+
+    streamed = SimpleNamespace(_lora_sources=[])
+    stub = SimpleNamespace(verbose=False, low_ram_streaming=True, lora_mode="unfused", _pending_loras=[("l.st", 1.0)])
+    stub._fuse_pending_loras = _no_fusion
+    with (
+        patch("ltx_pipelines_mlx.utils._orchestration.load_transformer", return_value=streamed),
+        patch("ltx_pipelines_mlx.utils._orchestration.resolve_lora_path", side_effect=lambda p: p),
+        patch("ltx_core_mlx.loader.block_streaming.BlockLoraSource", side_effect=lambda p, **kw: ("src", p)),
+    ):
+        dit = BasePipeline._load_transformer_with_optional_streaming(stub, Path("/fake/transformer.safetensors"))
+    assert dit is streamed
+    assert streamed._lora_sources == [("src", "l.st")]
+    assert "does not apply under --low-ram" in capsys.readouterr().err

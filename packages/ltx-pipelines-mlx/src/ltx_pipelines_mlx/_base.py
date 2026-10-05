@@ -67,19 +67,20 @@ def apply_compute_dtype_from_env(dit: LTXModel) -> LTXModel:
     return dit
 
 
-def unfused_loras_requested(low_ram_streaming: bool) -> bool:
-    """Whether ``LTX2_LORA_MODE=unfused`` applies to a DiT loaded with ``low_ram_streaming``.
+def unfused_loras_requested(lora_mode: str, low_ram_streaming: bool) -> bool:
+    """Whether the LoRA mode applies to a DiT loaded with ``low_ram_streaming``.
 
     ``--low-ram`` keeps fusing each block's LoRAs as the block is bound (the fused copy is thrown away
     after the block runs), so the setting only changes resident models; a note says so.
 
     Args:
+        lora_mode: The pipeline's parsed ``LTX2_LORA_MODE`` (:attr:`BasePipeline.lora_mode`).
         low_ram_streaming: Whether the pipeline streams the DiT blocks.
 
     Returns:
         ``True`` when LoRAs should be attached as run-time adapters instead of fused.
     """
-    if lora_mode_from_env() != "unfused":
+    if lora_mode != "unfused":
         return False
     if low_ram_streaming:
         print(
@@ -169,6 +170,9 @@ class BasePipeline:
         self.low_ram_streaming = low_ram_streaming
         self.verbose = verbose
         self._loaded = False
+        # LTX2_LORA_MODE is parsed here so a bad value fails before any work: it is only consulted
+        # when a LoRA is attached, which for --dfr is after stage 1.
+        self.lora_mode = lora_mode_from_env()
 
         if self.low_ram_streaming:
             # Disable Metal heap cache before any allocation. With cache enabled,
@@ -526,6 +530,8 @@ class BasePipeline:
 
                 return apply_compute_dtype_from_env(_impl(transformer_path, low_ram_streaming=self.low_ram_streaming))
 
+            # Before the --low-ram branch, so the note that unfused does not apply there is printed.
+            unfused = unfused_loras_requested(self.lora_mode, self.low_ram_streaming)
             if self.low_ram_streaming:
                 from ltx_core_mlx.loader.block_streaming import BlockLoraSource
                 from ltx_core_mlx.loader.sd_ops import (
@@ -550,7 +556,7 @@ class BasePipeline:
                 object.__setattr__(model, "_lora_sources", sources)
                 return apply_compute_dtype_from_env(model)
 
-            if unfused_loras_requested(self.low_ram_streaming):
+            if unfused:
                 from ltx_pipelines_mlx.utils._orchestration import attach_pending_loras
                 from ltx_pipelines_mlx.utils._orchestration import load_transformer as _load_impl
 

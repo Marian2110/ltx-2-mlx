@@ -1561,7 +1561,8 @@ kept in the LoRA file's dtype, which the float32 activations promote. `AttachedL
 the original module objects back in place, with the same arrays. The handle holds no model memory (weak
 references; the replaced layers it keeps are emptied while the adapter holds their parameters), so a
 pipeline that frees its DiT with LoRAs attached really frees it. Unset or `fused` is today's path,
-untouched.
+untouched. The value is parsed once, when the pipeline is built (`BasePipeline.lora_mode`), so a typo
+fails before any work rather than when the first LoRA is attached.
 
 | call site | unfused | notes |
 |---|---|---|
