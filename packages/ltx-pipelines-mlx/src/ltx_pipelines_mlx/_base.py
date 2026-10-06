@@ -23,6 +23,7 @@ from ltx_core_mlx.loader.lora_adapters import lora_mode_from_env
 from ltx_core_mlx.model.audio_vae.audio_vae import AudioVAEDecoder
 from ltx_core_mlx.model.audio_vae.bwe import VocoderWithBWE
 from ltx_core_mlx.model.transformer.model import LTXModel, LTXModelConfig, compute_dtype_from_env
+from ltx_core_mlx.model.transformer.sparse_attention import sol_taus_from_env
 from ltx_core_mlx.model.video_vae.video_vae import VideoDecoder, VideoEncoder
 from ltx_core_mlx.text_encoders.gemma.encoders.base_encoder import GemmaLanguageModel
 from ltx_core_mlx.text_encoders.gemma.feature_extractor import GemmaFeaturesExtractorV2
@@ -173,6 +174,9 @@ class BasePipeline:
         # LTX2_LORA_MODE is parsed here so a bad value fails before any work: it is only consulted
         # when a LoRA is attached, which for --dfr is after stage 1.
         self.lora_mode = lora_mode_from_env()
+        # LTX2_SOL_TAU: block-sparse video self-attention in the distilled stage 2 (None = dense, the default).
+        # Parsed here so a malformed value fails before any model load.
+        self.sol_taus = sol_taus_from_env()
 
         if self.low_ram_streaming:
             # Disable Metal heap cache before any allocation. With cache enabled,

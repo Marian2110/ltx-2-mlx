@@ -36,9 +36,13 @@ from __future__ import annotations
 import weakref
 from collections.abc import Iterable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import mlx.core as mx
 import mlx.nn as nn
+
+if TYPE_CHECKING:
+    from ltx_core_mlx.model.transformer.sparse_attention import SparseAttentionState
 
 __all__ = ["BlockLoraSource", "BlockStreamer", "StreamingLTXModel"]
 
@@ -369,6 +373,15 @@ class StreamingLTXModel(nn.Module):
         object.__setattr__(self, "_compiled_block", mx.compile(shared, inputs=shared))
         object.__setattr__(self, "_cast_dtype", dtype)
 
+    def set_sparse_attention(self, state: SparseAttentionState | None) -> None:
+        """Streamed ``LTXModel.set_sparse_attention``: the state follows the block bound into the shared block.
+
+        While it is on, forwards run the eager shared block: the compiled one would replay the tau and routing of
+        the step it was traced on.
+        """
+        inner = super().__getattr__("inner")
+        inner.set_sparse_attention(state)
+
     def __call__(self, *args, **kwargs):
         # Inject block_provider unless caller already passed one.
         if kwargs.get("block_provider") is None:
@@ -404,11 +417,15 @@ class StreamingLTXModel(nn.Module):
                     cast_dtype=cast_dtype,
                 )
                 prev_idx[0] = idx
+                # Block-sparse attention: block 0 stays dense, as in LTXModel.set_sparse_attention.
+                sparse = inner.sparse_attention
+                if sparse is not None:
+                    shared.attn1.sparse_attention = sparse if idx >= 1 else None
                 # The compiled block is traced for the current compute dtype; run the
                 # eager block if the two ever disagree.
                 traced = inner.compute_dtype is cast_dtype
                 compiled = object.__getattribute__(self, "_compiled_block")
-                return compiled if use_compiled and traced else shared
+                return compiled if use_compiled and traced and sparse is None else shared
 
             kwargs["block_provider"] = provider
         # The lazy AdaLN carrier (``PerTokenAdaLNParams``) is a non-tree

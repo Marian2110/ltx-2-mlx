@@ -15,6 +15,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ltx_core_mlx.model.transformer.rope import apply_rope_interleaved, apply_rope_split
+from ltx_core_mlx.model.transformer.sparse_attention import SparseAttentionState, sparse_self_attention
 
 
 def _cast_inputs(
@@ -102,6 +103,10 @@ class Attention(nn.Module):
         # LTXModel.set_compute_dtype, which also casts the parameters to match.
         self.compute_dtype: mx.Dtype | None = None
 
+        # Block-sparse self-attention (Sol routing), shared by the video self-attention modules while it is on;
+        # None = dense. Set through LTXModel.set_sparse_attention.
+        self.sparse_attention: SparseAttentionState | None = None
+
     def __call__(
         self,
         x: mx.array,
@@ -155,8 +160,23 @@ class Attention(nn.Module):
                 cos_fk, sin_fk = cos_f, sin_f
             k = _apply(k, cos_fk, sin_fk)
 
-        # Scaled dot-product attention (fused Flash Attention kernel)
-        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=attention_mask)
+        # Scaled dot-product attention (fused Flash Attention kernel). Plain self-attention calls (no mask, no STG
+        # perturbation) run block-sparse while LTXModel.set_sparse_attention has a tau for the current step.
+        sparse = self.sparse_attention
+        tau = None
+        if (
+            sparse is not None
+            and encoder_hidden_states is None
+            and attention_mask is None
+            and perturbation_mask is None
+        ):
+            tau = sparse.tau_for_call(N)
+        if sparse is not None and tau is not None:
+            out = sparse_self_attention(
+                q, k, v, self.scale, tau, sparse.tokens_per_frame, sparse.temporal, check=False
+            ).transpose(0, 2, 1, 3)
+        else:
+            out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=attention_mask)
 
         # STG perturbation: blend attn output with value projection
         # Reference: out = attn_out * mask + v * (1 - mask)

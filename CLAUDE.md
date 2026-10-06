@@ -1582,6 +1582,80 @@ detach restores the original objects and the exact output; a freed model is not 
 names unchanged; compute dtype followed; an in-place fusion still reaches an adapted layer; the
 ic-lora / dfr / `--lora` call sites; the default path identical to the fusion; env parsing).
 
+### Block-sparse stage-2 attention (`LTX2_SOL_TAU`)
+
+Opt-in port of NVIDIA's Sol-Attn routing (arXiv 2607.24027; reference code in NVlabs/Sana, `sol-engine` branch,
+Apache-2.0) to the video self-attention of the distilled stage 2, the scope NVIDIA's own LTX-2.5 distilled config uses
+(`models/ltx25/RTX5090/attention.py`): `attn1` only, block 0 dense, one threshold per stage-2 step.
+
+```bash
+LTX2_SOL_TAU=1.0,1.25,1.5 ltx-2-mlx generate --distilled ...   # NVIDIA's values; unset or "off" = dense (default)
+```
+
+How it works (`model/transformer/sparse_attention.py`):
+- Every head's sequence is cut into 64-token blocks with a query and a key centroid each. A query block attends exactly
+  to the key blocks whose centroid score passes `mean + tau * std` of its centroid scores (Sol's "diag" threshold), to
+  its neighbours (`|i - j| <= 1`) and, one rule beyond the reference, to the blocks holding the same (h, w) positions
+  one latent frame before and after (+0.2 % density). Every other key block enters the same softmax once, as its key
+  centroid with a `log(length)` bias and its value mean: `exp(s + ln L) * mean(V) = exp(s) * sum(V)`, Sol's
+  length-weighted correction.
+- The routing mask is built in MLX; the attention is MLX's own steel flash-attention loop (`steel_attention.h`, BQ=32,
+  BK=16, 4 simdgroups) over the routed blocks only, then the centroid tiles. The steel headers come from the installed
+  `mlx` and are compiled through `mx.fast.metal_kernel`. `tau = -inf` routes every block and is bit-identical to
+  `mx.fast.scaled_dot_product_attention` at head_dim 128 in float16, bfloat16 and float32. If the headers ever stop
+  compiling, `kernel_available()` is False, a warning is printed once and every call stays dense.
+- `LTXModel.set_sparse_attention(state)` attaches one `SparseAttentionState` to `attn1` of blocks 1 and up. Each forward
+  calls `state.prepare(timestep, video_positions)`: the tau is picked by matching the forward's sigma against the
+  stage-2 table (so tiles, guidance passes and the float16 overflow guard's recompute all get their step's tau; a sigma
+  outside the table runs dense), and the latent frame size is the leading run of tokens sharing the first token's time
+  (appended conditioning tokens, e.g. DFR's reference, do not change it). Calls with an attention mask, an STG
+  perturbation, cross-attention, or fewer than 4096 tokens stay dense.
+- `DistilledPipeline._stage2` turns it on around the stage-2 loop and off afterwards (also on error), so it covers
+  `generate --distilled` and the stage 2 of `generate --dfr`. Stage 1, the DFR temporal rounds and spatial epilogue, and
+  the other pipelines are untouched. Under `--low-ram` the streamed model attaches the state to whichever block is bound
+  and runs the eager shared block while it is on (the compiled block would replay the tau and routing of the step it
+  was traced on).
+
+Measured on an M1 Max 64 GB (MLX 0.32.2, 2.5 q8 pack), `LTX2_SOL_TAU=1.0,1.25,1.5` against unset, same command and
+seed, one run per arm (stage 1 is the same work in both arms and took the same time):
+
+| run | stage-2 tokens | stage-2 step, dense → sparse | whole render | peak footprint |
+|---|---:|---:|---:|---:|
+| `--distilled` I2V 576×1024×241, `LTX2_COMPUTE_DTYPE=float16` | 17,856 | 103 → 81 s (−21 %) | 534 → 470 s (−12 %) | 39.8 → 40.3 GB |
+| same, default compute (float32) | 17,856 | 139 → 105 s (−24 %) | 684 → 583 s (−15 %) | 40.8 → 42.0 GB |
+| `--distilled` I2V 1088×1920×121, float16 | 32,640 | 238 → 153 s (−36 %) | 1148 → 890 s (−22 %) | 53.2 → 53.4 GB |
+| `--dfr` I2V 576×1024×121, float16 | 14,400 | 76 → 64 s (−16 %) | 374 → 339 s (−9 %) | 40.7 → 40.4 GB |
+| `--distilled --low-ram` I2V 576×1024×121, float16 | 9,216 | 46 → 41 s (−11 %) | 262 → 246 s (−6 %) | 25.1 → 25.1 GB |
+| `--distilled` T2V 1024×576×121, float16 | 9,216 | 43 → 36 s (−16 %) | 241 → 222 s (−8 %) | 25.6 → 25.9 GB |
+
+The gain grows with the token count because only the attention gets cheaper (feed-forward, cross-attention and the
+projections are untouched). One attention call on real stage-2 q/k/v (28,160 tokens,
+float16): dense 1.72 s, every block routed 1.78 s (bit-identical), `tau = 1.0 / 1.25 / 1.5` ×4.1–4.9 / ×5.0–6.1 /
+×5.9–7.7, at 16–20 % routed density for `tau = 1.0`.
+
+Quality, sparse against the dense render of the same seed (evals suite: ArcFace to the start image, Whisper WER,
+SyncNet LSE-C, background warping error after optical flow):
+
+| run | PSNR / SSIM | ArcFace median, dense / sparse | WER, dense / sparse | LSE-C, dense / sparse | background warp ×1000, dense / sparse |
+|---|---:|---:|---:|---:|---:|
+| I2V 576×1024×241, float16 | 30.3 dB / 0.924 | 0.62 / 0.56 | 0 / 0 | 3.22 / 3.25 | 0.093 / 0.103 |
+| same, float32 | 30.8 dB / 0.927 | 0.64 / 0.59 | 0 / 0 | 3.25 / 3.42 | 0.096 / 0.098 |
+| I2V 1088×1920×121 | 31.7 dB / 0.954 | 0.55 / 0.53 | 0 / 0 | 5.60 / 5.87 | 0.243 / 0.262 |
+| `--dfr` 576×1024×121 | 32.3 dB / 0.938 | 0.73 / 0.64 | 0.06 / 0.06 | 0.80 / 0.78 | 0.158 / 0.180 |
+| `--low-ram` 576×1024×121 | 30.8 dB / 0.925 | 0.67 / 0.66 | 0 / 0.06 | 0.53 / 0.65 | 0.138 / 0.137 |
+| T2V 1024×576×121, flat wall and sky | 42.5 dB / 0.993 | — | — | — | 0.023 / 0.024 |
+
+Frames look the same; the differences are in fine, moving detail (strands of hair, the timing of a breaking wave), with
+no block artifacts on flat areas. Sparse attention costs some identity against the start image (ArcFace 0.01–0.09
+lower): later frames see the conditioning frame only through its centroids. Keeping the first latent frame exact for
+every query (a "sink") recovered a third to all of that, but made a stage-2 step up to 8.5 % slower (166 s instead of
+153 s at 32,640 tokens) and raised the background warping error in three of five I2V runs, with no visible difference
+in the clips, so it is not included.
+
+Tests: `tests/test_sparse_attention.py` (kernel vs dense at `tau = -inf` and vs a plain-MLX Sol reference at finite
+tau, routing rules, sigma-to-tau selection, the frame size, the module guards, the model and streamed wiring, the
+pipeline switch, env parsing, the unavailable-kernel fallback).
+
 ### `LTX2_GEMMA_MAX_LENGTH`
 
 Caps the padded Gemma sequence length (default `1024`). Reducing to `512` halves Gemma forward time but **shifts left-padded RoPE positions away from the LTX training distribution** — quality risk. Use only as a last resort on heavily contended systems.

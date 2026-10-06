@@ -21,6 +21,7 @@ For dev model + CFG quality, see :class:`TI2VidTwoStagesPipeline` /
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -33,6 +34,7 @@ from ltx_core_mlx.components.patchifiers import (
 )
 from ltx_core_mlx.conditioning.types.keyframe_slots import extract_generated_keyframes
 from ltx_core_mlx.model.transformer.model import X0Model
+from ltx_core_mlx.model.transformer.sparse_attention import SparseAttentionState
 from ltx_core_mlx.model.upsampler import LatentUpsampler
 from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.positions import (
@@ -265,6 +267,29 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             video_cross_attention_mask=video_cross_attention_mask,
             on_step=on_step,
         )
+
+    def _start_stage2_sparse_attention(self, sigmas: list[float]) -> SparseAttentionState | None:
+        """Turn on block-sparse video self-attention for stage 2 when ``LTX2_SOL_TAU`` asks for it.
+
+        One tau per stage-2 step, matched to the step's sigma (the last tau repeats); the terminal sigma 0 is never
+        evaluated. Covers ``--distilled`` and ``--dfr``, whose stage 2 is this one.
+        """
+        if self.sol_taus is None or self.dit is None:
+            return None
+        state = SparseAttentionState(taus=self.sol_taus, sigmas=tuple(sigmas[:-1]))
+        self.dit.set_sparse_attention(state)
+        if self.verbose:
+            steps = ", ".join(f"sigma {s:g}: tau {state.tau_for_sigma(s):g}" for s in state.sigmas)
+            print(f"[sparse-attention] stage 2 video self-attention, blocks 1+: {steps}", file=sys.stderr, flush=True)
+        return state
+
+    def _stop_stage2_sparse_attention(self, state: SparseAttentionState | None) -> None:
+        """Back to dense attention after stage 2."""
+        if state is None or self.dit is None:
+            return
+        self.dit.set_sparse_attention(None)
+        if self.verbose:
+            print(f"[sparse-attention] {state.calls} attention calls ran sparse", file=sys.stderr, flush=True)
 
     def generate_two_stage(  # type: ignore[override]
         self,
@@ -677,19 +702,23 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             stage2_x0_model = X0Model(TiledLTXModel(self.dit, tiler_2))
 
         self._pre_denoise_flush(video_state_2, audio_state_2)
-        output_2 = self._run_denoise_loop(
-            model=stage2_x0_model,
-            video_state=video_state_2,
-            audio_state=audio_state_2,
-            video_text_embeds=video_embeds,
-            audio_text_embeds=audio_embeds,
-            sigmas=sigmas_2,
-            video_cross_attention_mask=relay_mask(F, H_full, W_full, video_state_2.latent.shape[1]),
-            on_step=self._stepwise_hook(F, H_full, W_full, stage=2),
-            seed=seed,
-            ancestral=self._is_25,
-            noise_seed_offset=ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET,
-        )
+        sparse = self._start_stage2_sparse_attention(sigmas_2)
+        try:
+            output_2 = self._run_denoise_loop(
+                model=stage2_x0_model,
+                video_state=video_state_2,
+                audio_state=audio_state_2,
+                video_text_embeds=video_embeds,
+                audio_text_embeds=audio_embeds,
+                sigmas=sigmas_2,
+                video_cross_attention_mask=relay_mask(F, H_full, W_full, video_state_2.latent.shape[1]),
+                on_step=self._stepwise_hook(F, H_full, W_full, stage=2),
+                seed=seed,
+                ancestral=self._is_25,
+                noise_seed_offset=ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET,
+            )
+        finally:
+            self._stop_stage2_sparse_attention(sparse)
         if self.low_memory:
             aggressive_cleanup()
 

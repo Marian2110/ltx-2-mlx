@@ -28,6 +28,7 @@ import numpy as _np
 
 from ltx_core_mlx.guidance.perturbations import BatchedPerturbationConfig
 from ltx_core_mlx.model.transformer.adaln import AdaLayerNormSingle, PerTokenAdaLNParams
+from ltx_core_mlx.model.transformer.sparse_attention import SparseAttentionState
 from ltx_core_mlx.model.transformer.timestep_embedding import get_timestep_embedding
 from ltx_core_mlx.model.transformer.transformer import BasicAVTransformerBlock
 
@@ -590,6 +591,9 @@ class LTXModel(nn.Module):
         # Inner dtype of the attention / feed-forward modules; None = input dtype.
         self._compute_dtype: mx.Dtype | None = None
 
+        # Block-sparse video self-attention (Sol routing); None = dense. See set_sparse_attention.
+        self._sparse_attention: SparseAttentionState | None = None
+
     @property
     def compute_dtype(self) -> mx.Dtype | None:
         """Dtype the attention / feed-forward internals run in (``None``: input dtype)."""
@@ -614,6 +618,23 @@ class LTXModel(nn.Module):
             block.set_compute_dtype(dtype)
             _mx_eval(block.parameters())
         self._compute_dtype = dtype
+
+    @property
+    def sparse_attention(self) -> SparseAttentionState | None:
+        """The block-sparse video self-attention state while it is on (``None``: dense)."""
+        return self._sparse_attention
+
+    def set_sparse_attention(self, state: SparseAttentionState | None) -> None:
+        """Run the video self-attention (``attn1``) of blocks 1 and up block-sparse, or dense again with ``None``.
+
+        Block 0 stays dense, as in NVIDIA's LTX-2.5 config. Each forward selects its tau from its timestep
+        (:meth:`SparseAttentionState.prepare`); calls with a mask or an STG perturbation, and sequences shorter than
+        ``state.min_tokens``, stay dense. Under ``--low-ram``, ``StreamingLTXModel.set_sparse_attention`` attaches the
+        state to whichever block is bound.
+        """
+        for i, block in enumerate(self.transformer_blocks):
+            block.attn1.sparse_attention = state if i >= 1 else None
+        self._sparse_attention = state
 
     def _embed_timestep_scalar(
         self,
@@ -825,6 +846,9 @@ class LTXModel(nn.Module):
         """
         # Arguments kept for the overflow guard's recompute (compute dtype only).
         call_args = {k: v for k, v in locals().items() if k != "self"} if self._compute_dtype is not None else None
+        if self._sparse_attention is not None:
+            # Before the bfloat16 cast below: the tau is picked by matching this sigma against the step table.
+            self._sparse_attention.prepare(timestep, video_positions)
         # Cast inputs to bfloat16 to match weight dtype and avoid mixed-precision
         # accumulation errors over 48 transformer blocks
         video_latent = video_latent.astype(mx.bfloat16)
