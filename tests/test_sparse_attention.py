@@ -534,7 +534,7 @@ def test_malformed_env_fails_when_the_pipeline_is_built(tmp_path, monkeypatch):
 
 
 def test_kernel_unavailable_falls_back_to_dense(monkeypatch, capsys):
-    monkeypatch.setattr(sa, "_AVAILABLE", [False])
+    monkeypatch.setattr(sa, "_AVAILABLE", {mx.float16: False})
     attn = _attention()
     x = mx.random.normal((1, 300, 256)).astype(mx.float16)
     dense = attn(x)
@@ -544,3 +544,58 @@ def test_kernel_unavailable_falls_back_to_dense(monkeypatch, capsys):
     q, k, v = _qkv(130, mx.float16)
     with pytest.raises(RuntimeError, match="unavailable"):
         sparse_self_attention(q, k, v, 128**-0.5, tau=1.0)
+
+
+def _break_attention_kernel(monkeypatch, broken: mx.Dtype | None) -> list[dict]:
+    """Make the attention kernel fail to build for ``broken`` only (a future MLX breaking one steel instantiation;
+    ``None`` breaks nothing) and clear the probe cache. Returns the list every attention-kernel call is recorded in."""
+    real = sa._kernels()
+    calls: list[dict] = []
+
+    def attn(**kwargs):
+        calls.append(kwargs)
+        if broken is not None and dict(kwargs["template"])["T"] == broken:
+            raise RuntimeError(f"steel attention failed to compile for {broken}")
+        return real["attn"](**kwargs)
+
+    monkeypatch.setattr(sa, "_KERNELS", {"attn": attn, "sum": real["sum"]})
+    monkeypatch.setattr(sa, "_AVAILABLE", {})
+    return calls
+
+
+def test_probe_runs_the_kernel_variant_of_a_real_call(monkeypatch):
+    # mx.fast.metal_kernel passes inputs with fewer than 8 elements in constant memory, which builds another kernel:
+    # the probe must put every array input but the scalars (ip, sc) in device memory, as a real call (nb >= 64) does.
+    calls = _break_attention_kernel(monkeypatch, broken=None)
+    assert kernel_available(mx.float32)
+    (call,) = calls
+    names = ["q", "k", "v", "kc", "vc", "cb", "route", "ip", "sc"]
+    sizes = {name: a.size for name, a in zip(names, call["inputs"], strict=True)}
+    assert all(sizes[name] >= 8 for name in names[:7]), sizes
+    assert dict(call["template"])["T"] == mx.float32
+    assert call["inputs"][0].shape == (1, 2, sa._PROBE_TOKENS, 128)
+
+
+@pytest.mark.parametrize("broken", [mx.float32, mx.bfloat16])
+def test_kernel_broken_for_one_dtype_falls_back_to_dense_for_that_dtype_only(monkeypatch, capsys, broken):
+    _break_attention_kernel(monkeypatch, broken)
+
+    # The broken dtype stays dense for the whole render, with one warning, instead of failing mid stage 2.
+    attn = _attention()
+    attn.set_dtype(broken)
+    x = mx.random.normal((1, 300, 256)).astype(broken)
+    dense = attn(x)
+    attn.sparse_attention = state = _state(1.0)
+    assert mx.array_equal(attn(x), dense).item()
+    assert mx.array_equal(attn(x), dense).item()
+    assert state.calls == 0
+    err = capsys.readouterr().err
+    assert err.count("staying on dense attention") == 1 and str(broken) in err
+
+    # The other dtypes are probed on their own and still run sparse.
+    assert kernel_available(mx.float16)
+    attn16 = _attention()
+    attn16.sparse_attention = state16 = _state(1.0)
+    attn16(mx.random.normal((1, 300, 256)).astype(mx.float16))
+    assert state16.calls == 1
+    assert {broken: False, mx.float16: True} == sa._AVAILABLE

@@ -12,8 +12,9 @@ self-attention only, block 0 dense, with ``tau = 1.0, 1.25, 1.5`` over the three
 The attention itself is MLX's steel flash-attention loop (``steel/attn/kernels/steel_attention.h``, MIT, Copyright
 Apple; BQ=32, BK=16, 4 simdgroups, the shape MLX picks for head_dim 128 on non-NAX GPUs) run over the routed blocks
 only, followed by the centroid tiles of the skipped blocks. The routing mask is built in MLX before the kernel. The
-steel headers are read from the installed ``mlx`` package and compiled through ``mx.fast.metal_kernel``; if that fails
-(a future MLX changes them), :func:`kernel_available` is False and callers stay on the dense kernel.
+steel headers are read from the installed ``mlx`` package and compiled through ``mx.fast.metal_kernel``, one kernel per
+dtype; if that fails for a dtype (a future MLX changes them), :func:`kernel_available` is False for it and those calls
+stay on the dense kernel.
 
 One routing rule beyond the reference, measured on LTX-2.5 stage 2: with ``temporal``, the blocks holding the same
 (h, w) positions one latent frame before and after are always exact (+0.2 % density; 15-20 % lower per-layer error on
@@ -116,12 +117,13 @@ class SparseAttentionState:
             first = mx.argmax(later)
             self.tokens_per_frame = int(first.item()) if bool(later[first].item()) else int(t.shape[0])
 
-    def tau_for_call(self, num_tokens: int) -> float | None:
-        """The tau a self-attention call over ``num_tokens`` tokens runs with now, or ``None`` to stay dense.
+    def tau_for_call(self, num_tokens: int, dtype: mx.Dtype = mx.float16) -> float | None:
+        """The tau a self-attention call over ``num_tokens`` tokens in ``dtype`` runs with now, or ``None`` to stay dense.
 
-        Short sequences stay dense, and so does every call when the kernels are unavailable. Counts the sparse calls.
+        Short sequences stay dense, and so does every call when the kernels are unavailable in ``dtype``. Counts the
+        sparse calls.
         """
-        if self.tau is None or num_tokens < self.min_tokens or not kernel_available():
+        if self.tau is None or num_tokens < self.min_tokens or not kernel_available(dtype):
             return None
         self.calls += 1
         return self.tau
@@ -385,7 +387,14 @@ _SUM_BODY = r"""
 """
 
 _KERNELS: dict[str, Callable[..., Any]] = {}
-_AVAILABLE: list[bool] = []
+#: Probe result per dtype: ``mx.fast.metal_kernel`` builds a separate kernel for each ``T``.
+_AVAILABLE: dict[mx.Dtype, bool] = {}
+#: Probe tolerance against ``mx.fast.scaled_dot_product_attention``, per dtype.
+_PROBE_ATOL = {mx.float16: 2e-3, mx.bfloat16: 1.6e-2, mx.float32: 1e-4}
+#: Probe length: 9 blocks, the last one partial. ``mx.fast.metal_kernel`` passes inputs with fewer than 8 elements in
+#: ``constant`` memory, which builds a different kernel; with 9 blocks every array input but ``ip`` and ``sc`` (always
+#: scalars) is in device memory, as in a real call (nb >= 64).
+_PROBE_TOKENS = 8 * BLOCK + 3
 
 
 def _kernels() -> dict[str, Callable[..., Any]]:
@@ -415,25 +424,37 @@ def _kernels() -> dict[str, Callable[..., Any]]:
     return _KERNELS
 
 
-def kernel_available() -> bool:
-    """Whether the kernels build and run here (checked once, on a tiny exact problem).
+def kernel_available(dtype: mx.Dtype = mx.float16) -> bool:
+    """Whether the kernels build and run here in ``dtype`` (checked once per dtype, on a small exact problem).
 
-    False when the installed MLX lacks the steel headers this module compiles against, or the kernel errors; callers
-    then stay on the dense kernel and a warning is printed once.
+    The check runs the kernel variant a real call in ``dtype`` runs: q, k, v laid out as in ``attn1`` (heads transposed
+    out of ``(B, N, H, D)``) and long enough that every array input is in device memory (see ``_PROBE_TOKENS``).
+    False when the installed MLX lacks the steel headers this module compiles against, or the kernel errors or does
+    not match dense attention; callers then stay on the dense kernel and a warning is printed once per dtype.
     """
-    if not _AVAILABLE:
+    if dtype not in _AVAILABLE:
         try:
-            q, k, v = (mx.random.normal((1, 1, 130, 128), key=mx.random.key(i)).astype(mx.float16) for i in range(3))
+            q, k, v = (
+                mx.random.normal((1, _PROBE_TOKENS, 2, 128), key=mx.random.key(i)).astype(dtype).transpose(0, 2, 1, 3)
+                for i in range(3)
+            )
             out = sparse_self_attention(q, k, v, 128**-0.5, tau=-math.inf, check=False)
             ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=128**-0.5).transpose(0, 2, 1, 3)
-            ok = bool(mx.allclose(out.astype(mx.float32), ref.astype(mx.float32), atol=2e-3).item())
+            atol = _PROBE_ATOL.get(dtype, 2e-3)
+            ok = bool(mx.allclose(out.astype(mx.float32), ref.astype(mx.float32), atol=atol).item())
             if not ok:
-                print("warning: sparse attention kernel check failed; staying on dense attention", file=sys.stderr)
-            _AVAILABLE.append(ok)
+                print(
+                    f"warning: sparse attention kernel check failed for {dtype}; staying on dense attention",
+                    file=sys.stderr,
+                )
+            _AVAILABLE[dtype] = ok
         except Exception as exc:  # any build or run failure means "use the dense kernel"
-            print(f"warning: sparse attention kernel unavailable ({exc}); staying on dense attention", file=sys.stderr)
-            _AVAILABLE.append(False)
-    return _AVAILABLE[0]
+            print(
+                f"warning: sparse attention kernel unavailable for {dtype} ({exc}); staying on dense attention",
+                file=sys.stderr,
+            )
+            _AVAILABLE[dtype] = False
+    return _AVAILABLE[dtype]
 
 
 # ---------------------------------------------------------------------------
@@ -520,9 +541,9 @@ def sparse_self_attention(
     ``tau = -inf`` gives exactly ``mx.fast.scaled_dot_product_attention`` (same loop, every block routed).
 
     Raises:
-        RuntimeError: If ``check`` and the kernels are unavailable (see :func:`kernel_available`).
+        RuntimeError: If ``check`` and the kernels are unavailable in ``q.dtype`` (see :func:`kernel_available`).
     """
-    if check and not kernel_available():
+    if check and not kernel_available(q.dtype):
         raise RuntimeError("sparse attention kernel unavailable")
     B, H, N, D = q.shape
     qc, kc, vmean, log2_len = block_summaries(q, k, v)

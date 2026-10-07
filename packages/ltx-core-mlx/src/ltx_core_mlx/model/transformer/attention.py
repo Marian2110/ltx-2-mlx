@@ -170,7 +170,7 @@ class Attention(nn.Module):
             and attention_mask is None
             and perturbation_mask is None
         ):
-            tau = sparse.tau_for_call(N)
+            tau = sparse.tau_for_call(N, q.dtype)
         if sparse is not None and tau is not None:
             out = sparse_self_attention(
                 q, k, v, self.scale, tau, sparse.tokens_per_frame, sparse.temporal, check=False

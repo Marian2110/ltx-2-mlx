@@ -1602,8 +1602,11 @@ How it works (`model/transformer/sparse_attention.py`):
 - The routing mask is built in MLX; the attention is MLX's own steel flash-attention loop (`steel_attention.h`, BQ=32,
   BK=16, 4 simdgroups) over the routed blocks only, then the centroid tiles. The steel headers come from the installed
   `mlx` and are compiled through `mx.fast.metal_kernel`. `tau = -inf` routes every block and is bit-identical to
-  `mx.fast.scaled_dot_product_attention` at head_dim 128 in float16, bfloat16 and float32. If the headers ever stop
-  compiling, `kernel_available()` is False, a warning is printed once and every call stays dense.
+  `mx.fast.scaled_dot_product_attention` at head_dim 128 in float16, bfloat16 and float32. `kernel_available(dtype)`
+  checks the kernel once per dtype, the first time a call in that dtype would run sparse, on the variant a real call
+  builds (9 blocks, so every array input is in device memory: `mx.fast.metal_kernel` passes inputs with fewer than 8
+  elements in `constant` memory, which is another kernel). If it fails to build or does not match dense attention,
+  a warning is printed once for that dtype and its calls stay dense.
 - `LTXModel.set_sparse_attention(state)` attaches one `SparseAttentionState` to `attn1` of blocks 1 and up. Each forward
   calls `state.prepare(timestep, video_positions)`: the tau is picked by matching the forward's sigma against the
   stage-2 table (so tiles, guidance passes and the float16 overflow guard's recompute all get their step's tau; a sigma
