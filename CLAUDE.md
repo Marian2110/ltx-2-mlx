@@ -569,6 +569,37 @@ ltx-2-mlx generate --distilled --prompt "cinematic, a woman in a bedroom" \
 
 Flags: `--segment "TEXT" [LEN_FRAMES]` (repeatable, timeline order; omit LEN to auto-distribute), `--relay-epsilon` (default 1e-3, smaller = sharper), `--relay-strength` (default 1.0). Works on all `generate` modes; on CFG modes the mask applies to the **conditional pass only** (never the negative). **Not compatible with modality tiling** (raises). Correctness hinges on the Gemma connector front-packing valid tokens to column *i* (`_replace_padding_with_registers`) — token *i* in encode order → column *i* in the `Nk` axis. Inert on the default path (no `--segment` → `video_cross_attention_mask=None`, byte-identical output). Key files: `conditioning/prompt_relay.py`; `video_cross_attention_mask` kwarg threaded `LTXModel → BasicAVTransformerBlock → attn2`.
 
+**On 2.5 packs.** The Gemma-4 text encoder tokenizes with the pack's HuggingFace `tokenizer.json`, which (unlike the
+mlx-lm Gemma-3 tokenizer of the 2.3 packs) adds no `<bos>` and no `<eos>`; `map_token_ranges` measures with the same
+`encode` the encoder runs, so its ranges are the encoder's columns either way. `tests/test_prompt_relay_ltx25.py`
+(runs when the local pack is found, like the other `LTX25_Q8_DIR` tests) pins that chain on the real tokenizer: each
+range decodes to exactly its local prompt (quoted speech, non-ASCII, repeated spaces), the ranges index the valid
+tokens `Gemma4TextEncoder.tokenize` left-pads, and after `_replace_padding_with_registers` the mask's penalised
+columns are exactly those tokens. It fails if the encoder starts prepending `<bos>` (upstream's `LTXGemmaTokenizer`
+does on Gemma 4; this port's encoder does not), which would shift every range by one column.
+
+Validated end to end on the 2.5 q8 pack (M4 Pro 48 GB, `--distilled` and `--dfr`, 512×768×97 = 13 latent frames,
+seed 5, global "a woman in a kitchen, static camera" + `--segment` "she smiles at the camera" / "she turns around and
+walks away toward the window"; the no-relay arm encodes the same combined text as one `--prompt`). A face detector
+(insightface, score ≥ 0.6) gives the last frame where her face is visible:
+
+| run | segment lengths (latent frames) | last frame with her face | stage-1 / stage-2 s/step | peak footprint |
+|---|---|---:|---:|---:|
+| `--distilled`, no relay | — | 46 | 7.23 / 29.25 | 25.7 GB |
+| `--distilled` | 7 / 6 (auto) | 64 | 7.34 / 29.65 | 25.7 GB |
+| `--distilled` | 3 / 10 | 36 | 7.36 / 29.15 | 25.7 GB |
+| `--distilled` | 10 / 3 | 69 | 7.36 / 29.15 | 25.7 GB |
+| `--dfr`, no relay | — | 65 | 8.87 / 46.75 | 39.0 GB |
+| `--dfr` | 7 / 6 (auto) | 65 | 8.86 / 47.30 | 39.5 GB |
+| `--dfr` | 3 / 10 | 47 | 8.84 / 47.00 | 39.2 GB |
+
+The turn follows the segment lengths (36 → 64 → 69). It lands where the second segment's plateau starts, not on the
+nominal boundary: with the default `--relay-epsilon` both local prompts are strongly penalised in the latent frames
+between the two plateaus (half-width `L // 2 - 2`), so the global prompt alone drives that stretch. Without relay the
+2.5 model already plays the two sentences in order (its native multishot) and turns at frame 46; on `--dfr` the auto
+split turns at frame 65 with or without relay, and a 3 / 10 split moves the turn to frame 47. Overhead: one mask build per stage (≈3 ms, 10 MB at 4,992 stage-2
+tokens), within the 1 s resolution of the step timer.
+
 ### Multi-Anchor I2V (`--image` repeatable)
 
 All `generate` modes (`--one-stage`, `--two-stage`, `--two-stages-hq`, `--distilled`, `--dfr`) support multiple `--image` flags. Each anchor takes `PATH FRAME_IDX STRENGTH` where `FRAME_IDX` is the **pixel frame index** (0-based; for a 97-frame video the last frame is 96).
@@ -1354,7 +1385,7 @@ dtype on entry (like the conv decoder) and the same decode peaks at ~12 GB (5.8 
 | `hdr-ic-lora` | supported, **2.5 only** (upstream v1.4 SDR-to-HDR IC-LoRA, ACEScct); Experimental, validated end to end on real weights (see "HDR IC-LoRA Pipeline" › Status) |
 | `enhance` / `--enhance-prompt` | raises `NotImplementedError` (`_guard_enhance_not_gemma4`) — Gemma 3 only |
 | `--enable-teacache` | raises `ValueError` — 2.3 polynomial isn't calibrated for 2.5 |
-| Prompt Relay | validated on 2.3 only |
+| Prompt Relay | supported — validated e2e on 2.5 `--distilled` and the `--dfr` base path (see "Prompt Relay"); token ranges pinned against the pack's Gemma-4 tokenizer |
 | Modality tiling | validated on 2.5 `--distilled` (see "Position layout divergence" under Modality Tiling) |
 | Generated keyframe slots (`--num-generated-keyframes N`) | supported on `generate` (the four non-DFR modes, stage 1 only; `--dfr` places its own); refused up front on 2.3 packs (no `use_keyframes_abs_pos_embedding`) |
 | DFR (`DFRPipeline`) | complete — shipped as `generate --dfr`: base path (spatial detailing with the official 2.5 detailing IC-LoRA), keyframe-aware decode on `--video-decoder diffusion`, temporal rounds (`--temporal-upscalings {1,2}`), and the spatial epilogue (`--spatial-upscalings {1,2}`) |
