@@ -292,6 +292,17 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
         if self.verbose:
             print(f"[sparse-attention] {state.calls} attention calls ran sparse", file=sys.stderr, flush=True)
 
+    def _stage1_video_conditionings(self, spatial_dims: tuple[int, int, int]) -> list:
+        """Extra stage-1 video conditionings, applied after the I2V anchors and the generated keyframe slots.
+
+        None here. :class:`~ltx_pipelines_mlx.extend_distilled.ExtendDistilledPipeline` pins the
+        source clip's last latent frames at the start of the window.
+
+        Args:
+            spatial_dims: Stage-1 latent dims ``(F, H_half, W_half)``.
+        """
+        return []
+
     def _stage1_audio_state(
         self,
         audio_shape: tuple[int, int, int],
@@ -545,6 +556,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
         conditionings_1 = [
             *conditionings_1,
             *generated_keyframe_conditionings(generated_keyframes, num_frames, frame_rate=video_fps),
+            *self._stage1_video_conditionings((F, H_half, W_half)),
         ]
 
         video_state = create_noised_state(

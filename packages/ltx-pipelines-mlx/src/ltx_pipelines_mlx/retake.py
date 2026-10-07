@@ -64,6 +64,77 @@ DEFAULT_CFG_SCALE = 3.0
 DEFAULT_STG_SCALE = 1.0  # upstream LTX_2_3_PARAMS default
 
 
+def encode_video_tensor(encoder, video_tensor: mx.array) -> mx.array:
+    """VAE-encode a source clip, materialized while ``encoder`` is loaded.
+
+    Upstream encodes the source with ``tiled_encode(frames, TileSizeConfig.default())``
+    (768/64 px, 80/24 frames). A source that fits one tile is encoded untiled, which is
+    the same computation, so small sources keep their exact latents; a larger one is
+    tiled like upstream (704x1280x49: 23.7 GB Metal peak instead of 31.4 GB untiled).
+    The latent is evaluated here: ``mx.synchronize`` does not evaluate a lazy graph, so
+    a lazy encode would run inside the first denoising step, with the encoder weights,
+    the source pixels and the DiT all resident at once.
+
+    Args:
+        encoder: The loaded video VAE encoder.
+        video_tensor: ``(1, 3, F, H, W)`` pixels in ``[-1, 1]``.
+
+    Returns:
+        ``(1, 128, F', H', W')`` bf16 latent.
+    """
+    tiling = TilingConfig.default()
+    if len(prepare_tiles_for_encoding(video_tensor.shape, tiling)) > 1:
+        # fp32 blend buffers; back to the encoder's bf16 like upstream's ``.to(dtype)``.
+        latent = encoder.tiled_encode(video_tensor, tiling).astype(mx.bfloat16)
+    else:
+        latent = encoder.encode(video_tensor)
+    _materialize(latent)
+    return latent
+
+
+def encode_source_audio_latent(
+    pipe: BasePipeline,
+    video_path: str,
+    *,
+    num_frames: int,
+    frame_rate: float,
+    has_audio: bool,
+) -> mx.array:
+    """Encode a source clip's audio track (materialized, encoder freed under ``low_memory``).
+
+    A clip without audio, or whose audio cannot be read, gets a zero latent sized to the clip.
+
+    Returns:
+        ``(1, 8, T, 16)`` bf16 audio latent.
+    """
+    audio_latent: mx.array | None = None
+    if has_audio:
+        audio_data = load_audio(
+            video_path,
+            target_sample_rate=16000,
+            max_duration=num_frames / frame_rate,
+        )
+        if audio_data is not None:
+
+            def _encode_audio(enc, proc) -> mx.array:
+                latent = encode_audio(audio_data.waveform, audio_data.sample_rate, enc, proc)
+                _materialize(latent)
+                return latent
+
+            audio_latent = pipe.audio_conditioner(_encode_audio, free_after=pipe.low_memory)
+            if pipe.low_memory:
+                aggressive_cleanup()
+        elif pipe.low_memory:
+            pipe.audio_conditioner.free()
+    elif pipe.low_memory:
+        pipe.audio_conditioner.free()
+
+    if audio_latent is None:
+        audio_T = compute_audio_token_count(num_frames, frame_rate=frame_rate)
+        audio_latent = mx.zeros((1, 8, audio_T, 16), dtype=mx.bfloat16)
+    return audio_latent
+
+
 @dataclass(frozen=True)
 class _SourceMeta:
     """Source video metadata kept after the encoder is freed."""
@@ -94,7 +165,8 @@ class RetakePipeline(BasePipeline):
             one forward per step, no negative prompt and no CFG / STG. Upstream
             ``RetakePipeline``'s ``distilled`` flag, which defaults to ``True``
             there; here it defaults to ``False`` so the dev path stays the
-            default. :meth:`extend` has no distilled mode yet and raises.
+            default. :meth:`extend` raises on a distilled pipeline: the distilled extend is
+            :class:`~ltx_pipelines_mlx.extend_distilled.ExtendDistilledPipeline`.
     """
 
     def __init__(
@@ -137,57 +209,16 @@ class RetakePipeline(BasePipeline):
 
         # Encode video via ImageConditioner (loads → encodes → frees)
         video_tensor = load_video_frames(video_path, info.height, info.width, vae_compatible_frames)
-
-        # Upstream encodes the source with ``tiled_encode(frames, TileSizeConfig.default())``
-        # (768/64 px, 80/24 frames). A source that fits one tile is encoded untiled, which is
-        # the same computation, so small sources keep their exact latents; a larger one is
-        # tiled like upstream (704x1280x49: 23.7 GB Metal peak instead of 31.4 GB untiled).
-        tiling = TilingConfig.default()
-        tiled = len(prepare_tiles_for_encoding(video_tensor.shape, tiling)) > 1
-
-        # Both encodes are materialized while their encoder is loaded: ``mx.synchronize`` does not
-        # evaluate a lazy graph, so the VAE encode used to run inside the first denoising step,
-        # with the encoder weights, the source pixels and the DiT all resident at once.
-        def _encode_video(encoder) -> mx.array:
-            if tiled:
-                # fp32 blend buffers; back to the encoder's bf16 like upstream's ``.to(dtype)``.
-                latent = encoder.tiled_encode(video_tensor, tiling).astype(mx.bfloat16)
-            else:
-                latent = encoder.encode(video_tensor)
-            _materialize(latent)
-            return latent
-
-        video_latent = self.image_conditioner(_encode_video, free_after=self.low_memory)
+        video_latent = self.image_conditioner(
+            lambda encoder: encode_video_tensor(encoder, video_tensor), free_after=self.low_memory
+        )
         if self.low_memory:
             del video_tensor
             aggressive_cleanup()
 
-        # Encode audio via AudioConditioner (loads → encodes → frees) if present
-        audio_latent: mx.array | None = None
-        if info.has_audio:
-            audio_data = load_audio(
-                video_path,
-                target_sample_rate=16000,
-                max_duration=vae_compatible_frames / info.fps,
-            )
-            if audio_data is not None:
-
-                def _encode_audio(enc, proc) -> mx.array:
-                    latent = encode_audio(audio_data.waveform, audio_data.sample_rate, enc, proc)
-                    _materialize(latent)
-                    return latent
-
-                audio_latent = self.audio_conditioner(_encode_audio, free_after=self.low_memory)
-                if self.low_memory:
-                    aggressive_cleanup()
-            elif self.low_memory:
-                self.audio_conditioner.free()
-        elif self.low_memory:
-            self.audio_conditioner.free()
-
-        if audio_latent is None:
-            audio_T = compute_audio_token_count(vae_compatible_frames, frame_rate=info.fps)
-            audio_latent = mx.zeros((1, 8, audio_T, 16), dtype=mx.bfloat16)
+        audio_latent = encode_source_audio_latent(
+            self, video_path, num_frames=vae_compatible_frames, frame_rate=info.fps, has_audio=info.has_audio
+        )
 
         meta = _SourceMeta(
             height=info.height,
@@ -601,7 +632,10 @@ class RetakePipeline(BasePipeline):
             NotImplementedError: on a ``distilled`` pipeline (``extend`` runs the dev model only).
         """
         if self.distilled:
-            raise NotImplementedError("extend has no distilled mode yet; build RetakePipeline without distilled=True.")
+            raise NotImplementedError(
+                "RetakePipeline.extend has no distilled mode; use extend_distilled.ExtendDistilledPipeline "
+                "(extend --distilled)."
+            )
         video_embeds, audio_embeds, neg_video_embeds, neg_audio_embeds = self._encode_text_with_negative(
             prompt, negative_prompt
         )

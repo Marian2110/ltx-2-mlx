@@ -804,11 +804,42 @@ examples:
         action="store_true",
         help="Stream transformer blocks from mmap'd safetensors (see generate --low-ram)",
     )
-    ext.add_argument("--steps", type=int, default=None, help="Denoising steps (default: 30)")
-    ext.add_argument("--cfg-scale", type=float, default=None, help="CFG guidance scale (default: 3.0)")
+    ext.add_argument(
+        "--distilled",
+        action="store_true",
+        help=(
+            "[experimental] Extend on the distilled two-stage path, no CFG: the source's last 25 frames are "
+            "pinned at the start of a new window that is generated like generate --distilled (half resolution, "
+            "upscale, refine), as upstream continues a video chunk by chunk. Cost follows the new window, not the "
+            "source length. --direction after only; --steps, --cfg-scale, --stg-scale and --negative-prompt are "
+            "rejected."
+        ),
+    )
+    ext.add_argument(
+        "--image",
+        "-i",
+        action=_ImageAction,
+        nargs="+",
+        dest="images",
+        default=None,
+        metavar="ARG",
+        help=(
+            "[--distilled only] Image anchor for the new frames. Form: PATH [FRAME_IDX STRENGTH [CRF]], repeatable, "
+            "as generate --distilled --image. FRAME_IDX counts the appended frames only: 0 is the first new frame, "
+            "'last' or -1 the last one (8 x --extend-frames new frames). Every anchor is a guide "
+            "(VideoConditionByKeyframeIndex), applied in both stages. PATH alone means FRAME_IDX=0 STRENGTH=1.0."
+        ),
+    )
+    ext.add_argument("--steps", type=int, default=None, help="Denoising steps (default: 30; rejected by --distilled)")
+    ext.add_argument(
+        "--cfg-scale", type=float, default=None, help="CFG guidance scale (default: 3.0; rejected by --distilled)"
+    )
     _add_negative_prompt_arg(ext)
     ext.add_argument(
-        "--stg-scale", type=float, default=None, help="STG guidance scale (default: 1.0 — upstream LTX_2_3_PARAMS)"
+        "--stg-scale",
+        type=float,
+        default=None,
+        help="STG guidance scale (default: 1.0 — upstream LTX_2_3_PARAMS; rejected by --distilled)",
     )
 
     # --- keyframe ---
@@ -1616,6 +1647,12 @@ def _cmd_extend(args: argparse.Namespace) -> None:
     """Add frames before or after an existing video."""
     t0 = time.time()
 
+    if args.distilled:
+        _cmd_extend_distilled(args, t0)
+        return
+    if args.images:
+        raise SystemExit("extend --image needs --distilled (the dev extend takes no image anchors).")
+
     from ltx_pipelines_mlx.retake import RetakePipeline
 
     if not args.quiet:
@@ -1645,6 +1682,42 @@ def _cmd_extend(args: argparse.Namespace) -> None:
     if args.negative_prompt is not None:
         kwargs["negative_prompt"] = args.negative_prompt
     video_latent, audio_latent = pipe.extend_from_video(**kwargs)
+
+    _decode_and_save(pipe, video_latent, audio_latent, args)
+    _print_result(args.output, t0, args.quiet)
+
+
+def _cmd_extend_distilled(args: argparse.Namespace, t0: float) -> None:
+    """``extend --distilled``: the flags are checked before anything is built."""
+    if args.cfg_scale is not None or args.stg_scale is not None:
+        raise SystemExit("extend --distilled runs the distilled flow (no CFG / STG); drop --cfg-scale / --stg-scale.")
+    if args.negative_prompt is not None:
+        raise SystemExit("extend --distilled runs the distilled flow (no CFG); drop --negative-prompt.")
+    if args.steps is not None:
+        raise SystemExit("extend --distilled runs the distilled tables (8 + 3 steps); drop --steps.")
+    if args.direction != "after":
+        raise SystemExit("extend --distilled appends after the source only; drop --direction before.")
+
+    from ltx_pipelines_mlx.extend_distilled import ExtendDistilledPipeline
+
+    if not args.quiet:
+        print("Mode: Extend (after, distilled, no CFG)")
+        print(f"Video: {args.video}, +{args.extend_frames} latent frames")
+
+    pipe = ExtendDistilledPipeline(
+        model_dir=args.model,
+        gemma_model_id=args.gemma,
+        low_ram_streaming=getattr(args, "low_ram", False),
+    )
+    pipe.verbose = not args.quiet
+    pipe.stepwise = _build_stepwise(args)
+    video_latent, audio_latent = pipe.extend_from_video(
+        prompt=args.prompt,
+        video_path=args.video,
+        extend_frames=args.extend_frames,
+        seed=args.seed,
+        images=args.images,
+    )
 
     _decode_and_save(pipe, video_latent, audio_latent, args)
     _print_result(args.output, t0, args.quiet)

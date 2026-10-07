@@ -219,7 +219,7 @@ def test_distilled_retake_no_regen_audio_returns_the_source_audio(distilled_pipe
 def test_extend_refuses_the_distilled_mode(distilled_pipe):
     pipe, _, record = distilled_pipe
     video, audio = _source()
-    with pytest.raises(NotImplementedError, match="extend has no distilled mode"):
+    with pytest.raises(NotImplementedError, match="has no distilled mode; use extend_distilled"):
         pipe.extend(
             prompt="continue",
             source_video_latent=video,

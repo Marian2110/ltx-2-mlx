@@ -16,7 +16,7 @@ Start from what you have:
 - **Two images to interpolate between** → `keyframe`.
 - **A control video** (depth / canny / pose / motion tracks) → `ic-lora`; **an SDR clip to upgrade to HDR (2.5 packs)** → `hdr-ic-lora`.
 - **An audio track to drive the video** → `a2v` (dev + CFG) · `a2v --distilled` (distilled, no CFG, experimental).
-- **An existing video to change** → `retake` (a time range; `retake --distilled` runs the distilled model, experimental) · `extend` (add frames) · `lipdub` (re-sync lips to audio, experimental).
+- **An existing video to change** → `retake` (a time range; `retake --distilled` runs the distilled model, experimental) · `extend` (add frames; `extend --distilled` continues it on the distilled path, experimental) · `lipdub` (re-sync lips to audio, experimental).
 - **A prompt to improve first** → the `enhance` subcommand.
 
 Then pick by constraint: 16–32 GB machines add `--low-ram`; 1080p or clips over 8 s
@@ -165,6 +165,16 @@ Everything else is in [Common flags](#common-flags).
 - **Example:** `ltx-2-mlx extend -p "continue the scene" -v source.mp4 --extend-frames 4 --low-ram -o extended.mp4`
 - **Cost:** same rule as `retake` — the whole clip is denoised each step.
 
+### `extend --distilled`
+
+- **Produces:** the source video with `8 × N` frames appended after it (`--extend-frames N`, latent frames). The source's last 25 frames of video and audio latent are pinned at the start of a new window of `4 + N` latent frames, which is generated like `generate --distilled`: half resolution, 2× latent upsample, 3-step refine, no CFG (ancestral sampler on 2.5). This is how upstream continues a video chunk by chunk (`DistilledPipeline` chunks, `next_video_carry_frames=25`). The new frames are appended to the source's latent and the whole clip is decoded once.
+- **Packs:** 2.3 and 2.5. **Tier:** Experimental.
+- **Required:** `--prompt`, `--output`, `--video`, `--extend-frames`. The source size must be a multiple of 64 on both sides (the two-stage grid); the output keeps it.
+- **Own flags:** `--image PATH [FRAME STRENGTH [CRF]]` (repeatable, as on `generate --distilled`): an anchor for the new frames, as upstream passes images to each chunk. FRAME counts the appended frames only: `0` is the first new frame, `last` or `-1` the last one, so the valid range is `0 … 8 × N − 1` whatever the source length. Every anchor is a guide (it sits after the 25 carried frames), applied in both stages and re-encoded at full resolution for stage 2. Otherwise `extend`'s flags; `--direction` must stay `after`, and `--steps`, `--cfg-scale`, `--stg-scale` and `--negative-prompt` are rejected before anything loads. `LTX2_SOL_TAU` applies to its stage 2.
+- **Example:** `ltx-2-mlx extend --distilled -p "she nods and tucks her hair behind her ear" -v clip.mp4 --extend-frames 12 -o longer.mp4`
+- **Cost:** denoising follows the new window (`4 + N` latent frames), not the source length; encoding the source and decoding the result still grow with it. On an M1 Max (2.5 q8, `LTX2_COMPUTE_DTYPE=float16`), adding 4 s to a 10 s 704 × 1280 clip took 589 s, and to a 5 s clip 502 s; `extend` on the 5 s clip would denoise for about 5 h 50 min (176 s per forward × 120). At 512 × 768 × 49 + 16 frames, default environment: 103 s against 2398 s for `extend`.
+- **Notes:** the prompt describes the new window; the model sees only the last 25 source frames, so a face that is turned away or hidden there can come back as a different face, and details (earrings, hair colour, framing) drift over a few seconds. An anchor brings the face back: a front-facing frame of the source at the last new frame, strength 0.7 (Lightricks' first/last-frame value), took the new part's ArcFace from 0.42 to 0.55 on the 5 s case and from 0.61 to 0.67 on the 10 s one, with one larger frame change in the last third of a second as the clip settles on the anchor. On the 10 s clip the frame change at the join is 6.3 (mean absolute luma difference), against the clip's 95th percentile of 6.8. At 704 × 1280 on a 48 GB Mac, use `--low-ram` (31.7 GB peak footprint against 56.6 GB resident, same output bytes).
+
 ### `lipdub`
 
 - **Produces:** a reference clip re-synced so the lips follow its own audio track.
@@ -275,7 +285,7 @@ are utilities and have no column.
 | `--frame-rate` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
 | `--frames` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ |
 | `--auto-duration` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `--image` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ |
+| `--image` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ |
 | `--num-generated-keyframes` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `--no-audio` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `--video-decoder` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
@@ -324,6 +334,10 @@ and ignored.
 `retake --distilled` takes the `retake` column except the CFG flags: `--cfg-scale`,
 `--stg-scale` and `--negative-prompt` are rejected up front.
 
+`extend --distilled` takes the `extend` column except `--steps`, `--cfg-scale`, `--stg-scale`
+and `--negative-prompt` (rejected up front); `--direction` must be `after`. `--image` on `extend`
+needs `--distilled` (the dev `extend` rejects it up front).
+
 ## Progress output (stderr)
 
 All CLI progress goes to **stderr** so stdout stays clean for callers that pipe it:
@@ -346,5 +360,6 @@ All CLI progress goes to **stderr** so stdout stays clean for callers that pipe 
 - `generate --one-stage` vs `generate --two-stage`: same dev model + CFG, but `--one-stage` runs **once at the target resolution** (no upscaler dependency, simpler latents for downstream). `--two-stage` runs at half-res then upscales 2× and refines (typically faster overall and better at large targets). Pick `--one-stage` for native res ≤ 704 × 480 or if you don't trust the upsampler; pick `--two-stage` for everything else.
 - `generate --distilled` vs `generate --two-stage`: same half-res + upscale structure, but `--distilled` skips CFG entirely (8 stage 1 steps × 1 forward instead of 30 × 2-4). Fastest mode; quality slightly below the dev+CFG variants.
 - `a2v --distilled` vs `a2v`: the same audio conditioning (the input track frozen in both stages, its waveform muxed into the output), but the distilled transformer without CFG: 8 + 3 single forwards instead of 30 guided steps and a LoRA-fused refine. On an M1 Max (2.5 q8, default environment), 512 × 768, 49 frames: 109 s against 631 s.
+- `extend --distilled` vs `extend`: the same request (frames appended after the source), but the distilled transformer on a window of the source's last 25 frames plus the new ones, instead of 30 guided steps × 4 passes over the whole extended clip. On an M1 Max (2.5 q8, default environment), 512 × 768 × 49 + 16 frames: 103 s against 2398 s.
 - `retake --distilled` vs `retake`: the same window mask and audio handling, but the distilled transformer without CFG: 8 forwards instead of 30 steps × 4 passes over the whole clip. On an M1 Max (2.5 q8, default environment), 512 × 768, 49 frames: 148 s against 1793 s.
 - `--video-decoder diffusion` (LTX 2.5 packs only, experimental) reproduces upstream's **default** `chunked_eager` stage-5 mode exactly: the neighborhood-attention stage runs on four width slabs with a halo, so the first/last ~20 px of each row are edge-replicated rather than attending over the full volume — identical to upstream's own default-mode output, not a port shortfall. Decodes above the memory budget are tiled automatically (`--diffvae-tile` to override); conv remains the default decoder.
