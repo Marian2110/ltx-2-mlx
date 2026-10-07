@@ -812,6 +812,13 @@ def res2s_denoise_loop(
         sub_noise_a = _channelwise_normalize(mx.random.normal(audio_x.shape).astype(mx.float32))
         x_mid_v = _sde_step(x_anchor_v, x_mid_v, sigma, sub_sigma, sub_noise_v).astype(mx.float32)
         x_mid_a = _sde_step(x_anchor_a, x_mid_a, sigma, sub_sigma, sub_noise_a).astype(mx.float32)
+        # Re-apply the conditioning mask AFTER each noise injection: preserved tokens
+        # (image anchors, keyframe slots, denoise_mask=0) must never be renoised, or
+        # the model is handed noise at positions its per-token timesteps call clean.
+        # Same guard as euler_ancestral_denoising_loop; without it anchored I2V/fl2v
+        # drifts away from the anchor.
+        x_mid_v = apply_denoise_mask(x_mid_v, video_state.clean_latent, video_state.denoise_mask)
+        x_mid_a = apply_denoise_mask(x_mid_a, audio_state.clean_latent, audio_state.denoise_mask)
 
         # Bong iteration: refine anchor for stability at small step sizes
         if bongmath and h < 0.5 and sigma > 0.03:
@@ -843,6 +850,8 @@ def res2s_denoise_loop(
         step_noise_a = _channelwise_normalize(mx.random.normal(audio_x.shape).astype(mx.float32))
         video_x = _sde_step(x_anchor_v, x_next_v, sigma, sigma_next, step_noise_v).astype(mx.float32)
         audio_x = _sde_step(x_anchor_a, x_next_a, sigma, sigma_next, step_noise_a).astype(mx.float32)
+        video_x = apply_denoise_mask(video_x, video_state.clean_latent, video_state.denoise_mask)
+        audio_x = apply_denoise_mask(audio_x, audio_state.clean_latent, audio_state.denoise_mask)
 
         mx.async_eval(video_x, audio_x)
         _step_timed(estimator, step_idx, video_x, audio_x)
