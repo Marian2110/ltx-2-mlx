@@ -46,12 +46,16 @@ def captured_load(monkeypatch):
     def fake_probe(_path: str) -> _FakeVideoInfo:
         return _FakeVideoInfo(num_frames=72)
 
-    def fake_load(_path, height: int, width: int, max_frames: int) -> mx.array:
-        calls.append(max_frames)
-        return mx.zeros((1, 3, max_frames, height, width), dtype=mx.bfloat16)
+    def fake_decode(_path, starting_frame: int = 0, frame_cap: int | None = None) -> int:
+        calls.append(frame_cap)
+        return frame_cap
+
+    def fake_preprocess(frame_cap: int, height: int, width: int) -> mx.array:
+        return mx.zeros((1, 3, frame_cap, height, width), dtype=mx.bfloat16)
 
     monkeypatch.setattr(iclora_utils, "probe_video_info", fake_probe)
-    monkeypatch.setattr(iclora_utils, "load_video_frames_normalized", fake_load)
+    monkeypatch.setattr(iclora_utils, "decode_video_by_frame", fake_decode)
+    monkeypatch.setattr(iclora_utils, "video_preprocess", fake_preprocess)
     return calls
 
 

@@ -9,10 +9,10 @@ Public names match upstream verbatim:
 
 - ``DEFAULT_IMAGE_CRF`` — H.264 CRF of the pre-2.4 model generations (re-exported
   from :mod:`ltx_pipelines_mlx.utils.constants`, with ``LTX_2_4_IMAGE_CRF``).
-- ``decode_image`` — load an image file as ``numpy.ndarray`` (HWC, uint8).
+- ``decode_image`` — load an image file as an oriented sRGB ``numpy.ndarray`` (HWC, uint8).
 - ``encode_single_frame`` — encode one RGB frame to H.264 mp4 bytes.
 - ``decode_single_frame`` — decode the first frame of a buffer back to RGB.
-- ``preprocess`` — round-trip an image through libx264 at a given CRF.
+- ``preprocess`` — round-trip an image through libx264 (4:2:0) at a given CRF.
 - ``resize_and_center_crop`` — aspect-preserving resize + center crop.
 - ``to_vae_range`` / ``from_vae_range`` — ``[0, 1] ↔ [-1, 1]`` shifts.
 - ``load_image_and_preprocess`` — full I2V image pipeline (decode → CRF
@@ -25,16 +25,18 @@ haven't migrated to the upstream-named API keep working.
 
 from __future__ import annotations
 
+import logging
 import math
 import subprocess
+from collections.abc import Iterable, Iterator
 from io import BytesIO
 from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
-from PIL import Image
+from PIL import ExifTags, Image, ImageCms, UnidentifiedImageError
 
-from ltx_core_mlx.utils.ffmpeg import find_ffmpeg
+from ltx_core_mlx.utils.ffmpeg import find_ffmpeg, probe_video_info
 
 # Re-exported for upstream-iso import paths. ``DEFAULT_IMAGE_CRF`` is the CRF of the
 # pre-2.4 model generations (``LTX_2_4_IMAGE_CRF`` from 2.4 on); the value a run uses
@@ -42,6 +44,8 @@ from ltx_core_mlx.utils.ffmpeg import find_ffmpeg
 # Round-tripping the input image through libx264 brings it close to the LTX-2 training
 # distribution (real video frames carrying H.264 compression artefacts).
 from ltx_pipelines_mlx.utils.constants import DEFAULT_IMAGE_CRF, LTX_2_4_IMAGE_CRF
+
+logger = logging.getLogger(__name__)
 
 
 def to_vae_range(x: mx.array) -> mx.array:
@@ -54,14 +58,57 @@ def from_vae_range(z: mx.array) -> mx.array:
     return (z + 1.0) / 2.0
 
 
-def decode_image(image_path: str) -> np.ndarray:
-    """Load an image file as an ``HxWx3`` uint8 ``np.ndarray`` (RGB).
+_ORIENTATION_EXIF_KEY = next(key for key, value in ExifTags.TAGS.items() if value == "Orientation")
 
-    Mirrors upstream's signature; uses PIL under the hood (upstream uses
-    cv2 / pyav). RGB-converts so the array is always ``HWC, uint8``.
+_ORIENTATION_TO_ROTATION = {3: 180, 6: 270, 8: 90}
+
+_SRGB_PROFILE = ImageCms.createProfile("sRGB")
+
+
+def decode_image(image_path: str) -> np.ndarray:
+    """Load an image as an oriented, sRGB, three-channel uint8 RGB array.
+
+    Mirrors upstream ``decode_image``: the EXIF orientation is applied, an
+    embedded ICC profile is converted to sRGB (falling back to a plain RGB
+    conversion with a warning if the profile cannot be used), and the result
+    is ``HWC, uint8``.
+
+    Raises:
+        ValueError: If the file cannot be decoded as an image.
     """
-    img = Image.open(image_path).convert("RGB")
-    return np.asarray(img, dtype=np.uint8)
+    try:
+        with Image.open(image_path) as source_image:
+            image = source_image
+            orientation = image.getexif().get(_ORIENTATION_EXIF_KEY)
+            if orientation in _ORIENTATION_TO_ROTATION:
+                image = image.rotate(_ORIENTATION_TO_ROTATION[orientation], expand=True)
+
+            icc_profile = image.info.get("icc_profile")
+
+            if image.mode == "RGBA":
+                image = image.convert("RGB")
+            elif image.mode == "LA":
+                image = image.convert("L")
+
+            if icc_profile:
+                try:
+                    source_profile = ImageCms.ImageCmsProfile(BytesIO(icc_profile))
+                    destination_profile = ImageCms.ImageCmsProfile(_SRGB_PROFILE)
+                    image = ImageCms.profileToProfile(
+                        image,
+                        source_profile,
+                        destination_profile,
+                        outputMode="RGB",
+                    )
+                except (ImageCms.PyCMSError, OSError, ValueError) as error:
+                    logger.warning("Failed to convert image to sRGB: %s", error)
+                    image = image.convert("RGB")
+            else:
+                image = image.convert("RGB")
+
+            return np.array(image, dtype=np.uint8)
+    except (UnidentifiedImageError, OSError) as err:
+        raise ValueError(f"Cannot decode image file '{image_path}'.") from err
 
 
 def encode_single_frame(
@@ -71,10 +118,16 @@ def encode_single_frame(
 ) -> None:
     """Encode a single RGB frame to a 1-frame H.264 mp4.
 
-    Mirrors upstream's PyAV-based implementation using an ffmpeg subprocess
+    Mirrors upstream's PyAV-based implementation with an ffmpeg subprocess
     pipeline. Output goes to ``output_file`` (``BytesIO`` for in-memory or a
-    path string for disk). Even-pixel padding is handled internally; the
-    caller must crop back if the original dimensions were odd.
+    path string for disk). Like upstream, odd dimensions are cropped down to
+    the nearest even size (the decoded frame comes back cropped), and the frame
+    is encoded as 4:2:0 (``yuv420p``), the chroma subsampling of the video the
+    model was trained on. The encoder settings match what PyAV hands libx264:
+    bilinear RGB→YUV conversion (PyAV's ``reformat`` default) and slice
+    threading (PyAV's default thread type). The bitstream is not bit-identical
+    to upstream's: PyAV ships its own libx264 build, and the slice count follows
+    the machine's core count on both sides.
 
     Args:
         output_file: Destination — either a ``BytesIO`` (preferred, in-memory)
@@ -88,13 +141,10 @@ def encode_single_frame(
     if image_array.ndim != 3 or image_array.shape[2] != 3:
         raise ValueError(f"encode_single_frame expects HxWx3 RGB, got {image_array.shape}")
 
-    height, width, _ = image_array.shape
-    pad_w = width + (width & 1)
-    pad_h = height + (height & 1)
-    if (pad_w, pad_h) != (width, height):
-        padded = np.zeros((pad_h, pad_w, 3), dtype=np.uint8)
-        padded[:height, :width, :] = image_array
-        image_array = padded
+    # Round down to a multiple of 2 for the 4:2:0 codec, as upstream does.
+    height = image_array.shape[0] // 2 * 2
+    width = image_array.shape[1] // 2 * 2
+    image_array = np.ascontiguousarray(image_array[:height, :width])
 
     raw = image_array.tobytes()
     ffmpeg = find_ffmpeg()
@@ -106,17 +156,23 @@ def encode_single_frame(
         "-pix_fmt",
         "rgb24",
         "-s",
-        f"{pad_w}x{pad_h}",
+        f"{width}x{height}",
         "-r",
         "1",
         "-i",
         "pipe:0",
+        "-sws_flags",
+        "bilinear",
+        "-pix_fmt",
+        "yuv420p",
         "-c:v",
         "libx264",
         "-preset",
         "veryfast",
         "-crf",
         str(int(crf)),
+        "-thread_type",
+        "slice",
         "-frames:v",
         "1",
     ]
@@ -137,9 +193,8 @@ def encode_single_frame(
 def decode_single_frame(video_file: BytesIO | str) -> np.ndarray:
     """Decode the first frame of a video buffer/file back to ``HxWx3`` RGB.
 
-    Companion to :func:`encode_single_frame`. Returns the original odd-pixel
-    dimensions are NOT inferred here — caller is responsible for cropping
-    back if it padded for encoding.
+    Companion to :func:`encode_single_frame`. The YUV→RGB conversion is
+    bilinear, like PyAV's ``to_ndarray(format="rgb24")`` upstream.
     """
     ffmpeg = find_ffmpeg()
     if isinstance(video_file, BytesIO):
@@ -175,6 +230,8 @@ def decode_single_frame(video_file: BytesIO | str) -> np.ndarray:
         in_arg,
         "-frames:v",
         "1",
+        "-sws_flags",
+        "bilinear",
         "-pix_fmt",
         "rgb24",
         "-f",
@@ -206,7 +263,8 @@ def preprocess(image: np.ndarray, crf: int | None) -> np.ndarray:
     Mirrors upstream verbatim: encode → decode → return decoded RGB.
     ``crf == 0`` is a passthrough. ``crf`` is required: the correct value is a
     property of the model generation, so a code-level default here would
-    silently condition on the wrong compression.
+    silently condition on the wrong compression. As upstream, an odd height or
+    width comes back cropped to the nearest even size.
 
     Raises:
         ValueError: If ``crf`` is ``None`` — a conditioning skipped resolution
@@ -219,41 +277,67 @@ def preprocess(image: np.ndarray, crf: int | None) -> np.ndarray:
         )
     if crf == 0:
         return image
-    h, w, _ = image.shape
-    pad_w = w + (w & 1)
-    pad_h = h + (h & 1)
+    if min(image.shape[0], image.shape[1]) < 2:
+        return image
 
     with BytesIO() as buf:
         encode_single_frame(buf, image, crf)
         encoded_bytes = buf.getvalue()
-    decoded = decode_single_frame(BytesIO(encoded_bytes))
+    return decode_single_frame(BytesIO(encoded_bytes))
 
-    # Crop back to original odd dimensions if padding was applied.
-    if (pad_w, pad_h) != (w, h):
-        decoded = decoded[:h, :w, :]
-    return decoded
+
+def _bilinear_resize_axis(x: np.ndarray, out_size: int, axis: int) -> np.ndarray:
+    """Resize one axis like ``torch.nn.functional.interpolate(mode="bilinear", align_corners=False)``.
+
+    Half-pixel centres, source coordinates clamped at 0, no antialiasing on
+    downscale — the PyTorch semantics upstream relies on.
+    """
+    in_size = x.shape[axis]
+    scale = np.float32(in_size / out_size)
+    src = (np.arange(out_size, dtype=np.float32) + np.float32(0.5)) * scale - np.float32(0.5)
+    src = np.maximum(src, np.float32(0.0))
+    i0 = np.minimum(np.floor(src).astype(np.int64), in_size - 1)
+    i1 = np.minimum(i0 + 1, in_size - 1)
+    lam = (src - i0).astype(np.float32)
+    shape = [1] * x.ndim
+    shape[axis] = out_size
+    lam = lam.reshape(shape)
+    return np.take(x, i0, axis=axis) * (np.float32(1.0) - lam) + np.take(x, i1, axis=axis) * lam
 
 
 def resize_and_center_crop(
     image: Image.Image | np.ndarray,
     height: int,
     width: int,
-) -> Image.Image:
-    """Aspect-preserving resize then center-crop to ``(height, width)``.
+) -> np.ndarray:
+    """Aspect-preserving resize (filling the target), then center crop to ``(height, width)``.
 
-    Returns a PIL Image. Accepts a PIL Image or a uint8 numpy HWC array.
-    Mirrors upstream's ``resize_and_center_crop`` semantics.
+    Mirrors upstream ``resize_and_center_crop``: the frame is resized on float
+    values with PyTorch-style bilinear interpolation (``align_corners=False``,
+    no antialiasing), with the resized size rounded up, and then center cropped.
+    The values are not re-quantized to uint8.
+
+    Args:
+        image: ``HxWx3`` RGB array (any numeric dtype, values in ``[0, 255]``)
+            or a PIL image.
+        height: Target height.
+        width: Target width.
+
+    Returns:
+        ``(height, width, 3)`` float32 array in ``[0, 255]``.
     """
-    if isinstance(image, np.ndarray):
-        image = Image.fromarray(image, mode="RGB")
-    src_w, src_h = image.size
+    if isinstance(image, Image.Image):
+        image = np.asarray(image.convert("RGB"))
+    image = np.asarray(image, dtype=np.float32)
+    src_h, src_w = image.shape[:2]
     scale = max(height / src_h, width / src_w)
+    # Ceil so float rounding never leaves the resized size below the target (negative crop offsets).
     new_h = math.ceil(src_h * scale)
     new_w = math.ceil(src_w * scale)
-    image = image.resize((new_w, new_h), Image.LANCZOS)
-    crop_left = (new_w - width) // 2
+    resized = _bilinear_resize_axis(_bilinear_resize_axis(image, new_h, axis=0), new_w, axis=1)
     crop_top = (new_h - height) // 2
-    return image.crop((crop_left, crop_top, crop_left + width, crop_top + height))
+    crop_left = (new_w - width) // 2
+    return resized[crop_top : crop_top + height, crop_left : crop_left + width]
 
 
 def load_image_and_preprocess(
@@ -265,10 +349,10 @@ def load_image_and_preprocess(
     """Full I2V image pipeline (upstream-iso).
 
     Pipeline (upstream verbatim):
-        1. :func:`decode_image` — load PNG/JPEG → HxWx3 uint8.
-        2. :func:`preprocess` — H.264 round-trip at ``crf``.
-        3. :func:`resize_and_center_crop` — fit to target H/W.
-        4. ``[0, 1] → [-1, 1]`` (:func:`to_vae_range`) + HWC→BCHW + bfloat16.
+        1. :func:`decode_image` — load PNG/JPEG → oriented sRGB HxWx3 uint8.
+        2. :func:`preprocess` — H.264 4:2:0 round-trip at ``crf``.
+        3. :func:`resize_and_center_crop` — bilinear fit to target H/W, on floats.
+        4. ``x / 127.5 - 1`` (upstream ``normalize_images``) + HWC→BCHW + bfloat16.
 
     Mirrors upstream's ``load_image_and_preprocess`` signature; the upstream
     ``dtype`` / ``device`` arguments are dropped (MLX uses bfloat16 + unified
@@ -284,12 +368,84 @@ def load_image_and_preprocess(
     arr = preprocess(arr, crf=crf)
     image = resize_and_center_crop(arr, height, width)
 
-    # HWC uint8 → float32 → [-1, 1]
-    f = np.asarray(image, dtype=np.float32) / 255.0
-    f = f * 2.0 - 1.0
+    # [0, 255] float32 → [-1, 1] (upstream ``normalize_images``)
+    f = image / np.float32(127.5) - np.float32(1.0)
     # HWC → CHW → BCHW
     tensor = mx.array(f).transpose(2, 0, 1)[None, ...]
     return tensor.astype(mx.bfloat16)
+
+
+def decode_video_by_frame(
+    path: str | Path,
+    starting_frame: int = 0,
+    frame_cap: int | None = None,
+) -> Iterator[np.ndarray]:
+    """Decode a video by sequential frame index, at its native size.
+
+    Mirrors upstream ``decode_video_by_frame`` (PyAV): frames come out in
+    decode order, the first ``starting_frame`` are skipped, at most
+    ``frame_cap`` are yielded, and nothing is resized or rotated (PyAV does not
+    apply the display-matrix rotation, hence ``-noautorotate``). The YUV→RGB
+    conversion is bilinear, like PyAV's ``to_rgb()``.
+
+    Args:
+        path: Path to the video file.
+        starting_frame: Number of leading frames to skip.
+        frame_cap: Maximum number of frames to yield (``None`` = all).
+
+    Yields:
+        ``(H, W, 3)`` uint8 RGB frames.
+
+    Raises:
+        RuntimeError: If ffmpeg cannot decode the file.
+    """
+    info = probe_video_info(str(path))
+    frame_bytes = info.width * info.height * 3
+    cmd = [find_ffmpeg(), "-v", "error", "-noautorotate", "-i", str(path)]
+    if starting_frame > 0:
+        cmd += ["-vf", f"select=gte(n\\,{starting_frame})"]
+    if frame_cap is not None:
+        cmd += ["-frames:v", str(frame_cap)]
+    cmd += ["-fps_mode", "passthrough", "-sws_flags", "bilinear", "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdout is not None
+    try:
+        while True:
+            buf = proc.stdout.read(frame_bytes)
+            if len(buf) < frame_bytes:
+                break
+            yield np.frombuffer(buf, dtype=np.uint8).reshape(info.height, info.width, 3)
+    finally:
+        proc.stdout.close()
+        stderr = proc.stderr.read() if proc.stderr is not None else b""
+        returncode = proc.wait()
+    if returncode != 0:
+        raise RuntimeError(f"ffmpeg failed to decode {path}: {stderr.decode(errors='ignore')}")
+
+
+def video_preprocess(frames: Iterable[np.ndarray], height: int, width: int) -> mx.array:
+    """Resize, center crop and normalize video frames for conditioning.
+
+    Mirrors upstream ``video_preprocess``: every frame goes through
+    :func:`resize_and_center_crop` (bilinear on floats, aspect-preserving fill)
+    and ``x / 127.5 - 1``.
+
+    Args:
+        frames: ``(H, W, 3)`` uint8 RGB frames, e.g. from :func:`decode_video_by_frame`.
+        height: Target height in pixels.
+        width: Target width in pixels.
+
+    Returns:
+        ``mx.array`` of shape ``(1, 3, F, height, width)`` in ``[-1, 1]``, bfloat16.
+
+    Raises:
+        ValueError: If ``frames`` is empty.
+    """
+    processed = [resize_and_center_crop(frame, height, width) / np.float32(127.5) - np.float32(1.0) for frame in frames]
+    if not processed:
+        raise ValueError("video_preprocess received an empty frame generator; no frames were decoded from the source.")
+    video = np.stack(processed)  # (F, H, W, 3)
+    return mx.array(video).transpose(3, 0, 1, 2)[None].astype(mx.bfloat16)
 
 
 __all__ = [
@@ -297,10 +453,12 @@ __all__ = [
     "LTX_2_4_IMAGE_CRF",
     "decode_image",
     "decode_single_frame",
+    "decode_video_by_frame",
     "encode_single_frame",
     "from_vae_range",
     "load_image_and_preprocess",
     "preprocess",
     "resize_and_center_crop",
     "to_vae_range",
+    "video_preprocess",
 ]

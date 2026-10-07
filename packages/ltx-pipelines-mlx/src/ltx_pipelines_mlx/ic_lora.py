@@ -36,7 +36,6 @@ from ltx_core_mlx.model.transformer.model import X0Model
 from ltx_core_mlx.model.upsampler import LatentUpsampler
 from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_token_count, compute_video_positions
-from ltx_core_mlx.utils.video import load_video_frames_normalized
 from ltx_core_mlx.utils.weights import apply_quantization, load_split_safetensors
 from ltx_pipelines_mlx._base import BasePipeline, unfused_loras_requested
 from ltx_pipelines_mlx.iclora_utils import (
@@ -46,6 +45,7 @@ from ltx_pipelines_mlx.iclora_utils import (
 from ltx_pipelines_mlx.scheduler import DISTILLED_SIGMAS, STAGE_2_SIGMAS, shorten_schedule
 from ltx_pipelines_mlx.utils.blocks import snap_num_frames
 from ltx_pipelines_mlx.utils.helpers import create_noised_state
+from ltx_pipelines_mlx.utils.media_io import decode_video_by_frame, video_preprocess
 from ltx_pipelines_mlx.utils.samplers import denoise_loop
 
 logger = logging.getLogger(__name__)
@@ -858,8 +858,8 @@ def _load_mask_video(
     Returns:
         ``mx.array`` of shape ``(1, 1, F, H, W)``, bfloat16, values in ``[0, 1]``.
     """
-    # load_video_frames_normalized returns shape (1, 3, F, H, W) in [-1, 1].
-    frames = load_video_frames_normalized(mask_path, height, width, num_frames)
+    # (1, 3, F, H, W) in [-1, 1], resized like upstream ``video_preprocess``.
+    frames = video_preprocess(decode_video_by_frame(mask_path, frame_cap=num_frames), height, width)
     # Channel-average (RGB → grayscale): (1, 3, F, H, W) → (1, 1, F, H, W).
     mask = frames.mean(axis=1, keepdims=True)
     # [-1, 1] → [0, 1].

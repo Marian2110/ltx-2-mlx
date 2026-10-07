@@ -22,7 +22,7 @@ from ltx_core_mlx.conditioning.types.attention_strength_wrapper import Condition
 from ltx_core_mlx.conditioning.types.reference_video_cond import VideoConditionByReferenceLatent
 from ltx_core_mlx.utils.ffmpeg import probe_video_info
 from ltx_core_mlx.utils.positions import compute_video_positions
-from ltx_core_mlx.utils.video import load_video_frames_normalized
+from ltx_pipelines_mlx.utils.media_io import decode_video_by_frame, video_preprocess
 
 logger = logging.getLogger(__name__)
 
@@ -138,8 +138,9 @@ def append_ic_lora_reference_video_conditionings(
         max_frames = min(num_frames, info.num_frames)
         k = max(1, (max_frames - 1) // 8)
         vae_compatible_frames = 1 + k * 8
-        video = load_video_frames_normalized(video_path, ref_height, ref_width, vae_compatible_frames)
-        video = (video * 2.0 - 1.0).astype(mx.bfloat16)
+        video = video_preprocess(
+            decode_video_by_frame(video_path, frame_cap=vae_compatible_frames), ref_height, ref_width
+        )
         encoded_video = video_encoder.encode(video)
         _mx_eval(encoded_video)
 

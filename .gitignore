@@ -15,6 +15,8 @@ env/
 *.safetensors
 *.gguf
 *.npz
+# Small torch golden fixtures used by the parity tests are versioned.
+!tests/fixtures/*.npz
 *.npy
 *.ckpt
 *.pt
@@ -26,6 +28,8 @@ env/
 .coverage
 htmlcov/
 *.mp4
+# Tiny test clips used by the parity tests are versioned.
+!tests/fixtures/*.mp4
 *.mov
 *.avi
 *.wav

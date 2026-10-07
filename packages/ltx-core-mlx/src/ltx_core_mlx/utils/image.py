@@ -46,8 +46,8 @@ def prepare_image_for_encoding(
        validation sampler pass the CRF resolved from the checkpoint
        (``ImageConditioner.resolve_crf`` / ``default_image_crf``). ``None``
        raises, as upstream.
-    3. Aspect-preserving resize + center crop to ``(height, width)``.
-    4. Normalize ``[0, 1] → [-1, 1]``, ``HWC → BCHW``, bfloat16.
+    3. Aspect-preserving bilinear resize (on floats) + center crop to ``(height, width)``.
+    4. Normalize ``x / 127.5 - 1`` (``[-1, 1]``), ``HWC → BCHW``, bfloat16.
 
     Returns:
         mx.array of shape ``(1, 3, H, W)`` in ``[-1, 1]``, bfloat16.
@@ -72,8 +72,7 @@ def prepare_image_for_encoding(
     arr = preprocess(arr, crf=crf)
     cropped = resize_and_center_crop(arr, height, width)
 
-    f = np.asarray(cropped, dtype=np.float32) / 255.0
-    f = f * 2.0 - 1.0
+    f = cropped / np.float32(127.5) - np.float32(1.0)
     tensor = mx.array(f).transpose(2, 0, 1)[None, ...]
     return tensor.astype(mx.bfloat16)
 
