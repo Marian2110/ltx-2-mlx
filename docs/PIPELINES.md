@@ -15,7 +15,7 @@ Start from what you have:
 - **Text + one or more images** → the same `generate` modes (all five, `--dfr` included) with `--image PATH FRAME STRENGTH` (repeatable).
 - **Two images to interpolate between** → `keyframe`.
 - **A control video** (depth / canny / pose / motion tracks) → `ic-lora`; **an SDR clip to upgrade to HDR (2.5 packs)** → `hdr-ic-lora`.
-- **An audio track to drive the video** → `a2v`.
+- **An audio track to drive the video** → `a2v` (dev + CFG) · `a2v --distilled` (distilled, no CFG, experimental).
 - **An existing video to change** → `retake` (a time range) · `extend` (add frames) · `lipdub` (re-sync lips to audio, experimental).
 - **A prompt to improve first** → the `enhance` subcommand.
 
@@ -129,6 +129,15 @@ Everything else is in [Common flags](#common-flags).
 - **Example:** `ltx-2-mlx a2v -p "a singer performing" --audio music.wav -i photo.jpg -f 97 --frame-rate 24 -o out.mp4`
 - **Notes:** sync quality depends on how well the prompt matches the audio. Audio CFG runs at 7.0.
 
+### `a2v --distilled`
+
+- **Produces:** video driven by an existing audio track, optionally anchored on images, on the distilled two-stage path of `generate --distilled`: half-res pass, 2× latent upsample, 3-step refine. The input audio's latent is frozen in both stages, and the output carries the input waveform, cut to the clip.
+- **Packs:** 2.3 and 2.5 (on 2.5 both stages use the ancestral sampler, as in `generate --distilled`). **Tier:** Experimental.
+- **Required:** `--prompt`, `--output`, `--frame-rate`, `--audio`.
+- **Own flags:** `--frames` (97), `--audio-start` (0 s), `--stage1-steps` (8), `--stage2-steps` (3), `--image`. No CFG, so `--cfg-scale`, `--stg-scale`, `--negative-prompt` and `--enable-teacache` are rejected before anything loads.
+- **Example:** `ltx-2-mlx a2v --distilled -p "a woman talks to the camera" --audio vocals.wav -i photo.jpg -H 1280 -W 704 -f 121 --frame-rate 24 -o out.mp4`
+- **Notes:** mirrors Lightricks' `LTX-2.5_A2V_Two_Stage_Distilled` ComfyUI workflow. With music or loud ambience, pass the isolated vocals (Lightricks' LTX-2.0 A2V template separates them before encoding); on a front-facing test clip, a voice over street ambience synced about as well as the vocals alone (SyncNet LSE-C 4.52 vs 4.57). Costs a `generate --distilled` render: 512 × 768, 49 frames, takes 109 s on an M1 Max (2.5 q8) against 631 s for `a2v`.
+
 ### `retake`
 
 - **Produces:** the source video with one latent-frame range regenerated. Dev model + CFG, single stage.
@@ -215,10 +224,10 @@ would otherwise not fit. On a 32 GB Mac at typical token counts, prefer `--low-r
 
 | Flag or variable | Default | Effect | Applies to |
 |---|---|---|---|
-| `--enable-teacache` | off | Timestep-aware residual caching in stage 1. About 1.46× on the Euler sampler and 1.78× on res_2s. The same seed gives a different render, often a different composition, so it cannot preview a plain render. [Details](../CLAUDE.md#teacache-opt-in-stage-1-acceleration). LTX-2.3 packs only (refused on 2.5). | `generate --two-stage`, `generate --two-stages-hq`, `a2v` |
+| `--enable-teacache` | off | Timestep-aware residual caching in stage 1. About 1.46× on the Euler sampler and 1.78× on res_2s. The same seed gives a different render, often a different composition, so it cannot preview a plain render. [Details](../CLAUDE.md#teacache-opt-in-stage-1-acceleration). LTX-2.3 packs only (refused on 2.5). | `generate --two-stage`, `generate --two-stages-hq`, `a2v` (not `--distilled`) |
 | `--teacache-thresh F` | 0.5 Euler, 1.0 res_2s | How aggressively steps are skipped. Higher is faster and lossier. Ignored without `--enable-teacache`. | with `--enable-teacache` |
 | `--stage2-steps N` | full table (3) | Fewer stage-2 refine steps. Takes the **last** N sigmas of the stage-2 table, so the refine re-noises less and always finishes at σ=0 (`1` → `[0.421875, 0.0]`, `2` → `[0.725, 0.421875, 0.0]`). A one-step refine gives a usable preview of the shot, not a softer copy of it. | every two-stage pipeline |
-| `--stage1-steps N` | full table (8) | On a pipeline whose stage 1 uses the fixed distilled table, keeps σ=1.0 and then the **last** N sigmas of the table (`3` → `[1.0, 0.725, 0.421875, 0.0]`). On `--two-stage`, `--two-stages-hq`, `a2v` and dev-mode `keyframe`, stage 1 uses the dynamic schedule instead and N is simply its step count. | every two-stage pipeline |
+| `--stage1-steps N` | full table (8) | On a pipeline whose stage 1 uses the fixed distilled table, keeps σ=1.0 and then the **last** N sigmas of the table (`3` → `[1.0, 0.725, 0.421875, 0.0]`). On `--two-stage`, `--two-stages-hq`, `a2v` (without `--distilled`) and dev-mode `keyframe`, stage 1 uses the dynamic schedule instead and N is simply its step count. | every two-stage pipeline |
 | `LTX2_GEMMA_EVAL_EVERY` | 1 | Per-layer flush cadence in the Gemma forward, which keeps each Metal command buffer under the macOS GPU watchdog deadline. Set to `0` only if you have never seen a watchdog crash. [Details](../CLAUDE.md#metal-watchdog-mitigation). | all pipelines |
 | `LTX2_DIT_EVAL_EVERY` | 8 | Same guard for the DiT block loop: flush every N of the 48 blocks. `0` disables it. | all pipelines |
 | `LTX2_COMPUTE_DTYPE` | unset | Dtype for the inside of the DiT's attention and feed-forward modules. Unset, the blocks run in float32 (the F32 AdaLN tables promote them). `float16` keeps the residual stream and AdaLN modulation in float32 and runs the projections and attention in float16: on an M1 Max with the 2.5 q8 pack, a 576×1024×241 `--distilled` I2V render went from 701 s to 563 s. `bfloat16` is the precision upstream PyTorch uses. Off by default; a step whose output is not finite is recomputed without it. [Details](../CLAUDE.md#dit-compute-dtype-ltx2_compute_dtype). | all pipelines |
@@ -300,6 +309,9 @@ mode. The five `generate` modes share one parser: a ❌ flag on one of them is e
 rejected up front with an explicit error (CFG, TeaCache and DFR-only flags) or accepted
 and ignored.
 
+`a2v --distilled` takes the `a2v` column except the CFG and TeaCache flags: `--cfg-scale`,
+`--stg-scale`, `--negative-prompt` and `--enable-teacache` are rejected up front.
+
 ## Progress output (stderr)
 
 All CLI progress goes to **stderr** so stdout stays clean for callers that pipe it:
@@ -321,4 +333,5 @@ All CLI progress goes to **stderr** so stdout stays clean for callers that pipe 
 - `generate` requires a mode flag (`--one-stage`, `--two-stage`, `--two-stages-hq`, `--distilled`, or `--dfr` on 2.5 packs, experimental). There is **no implicit default** — every pipeline maps 1:1 to an upstream Lightricks/LTX-2 class.
 - `generate --one-stage` vs `generate --two-stage`: same dev model + CFG, but `--one-stage` runs **once at the target resolution** (no upscaler dependency, simpler latents for downstream). `--two-stage` runs at half-res then upscales 2× and refines (typically faster overall and better at large targets). Pick `--one-stage` for native res ≤ 704 × 480 or if you don't trust the upsampler; pick `--two-stage` for everything else.
 - `generate --distilled` vs `generate --two-stage`: same half-res + upscale structure, but `--distilled` skips CFG entirely (8 stage 1 steps × 1 forward instead of 30 × 2-4). Fastest mode; quality slightly below the dev+CFG variants.
+- `a2v --distilled` vs `a2v`: the same audio conditioning (the input track frozen in both stages, its waveform muxed into the output), but the distilled transformer without CFG: 8 + 3 single forwards instead of 30 guided steps and a LoRA-fused refine. On an M1 Max (2.5 q8, default environment), 512 × 768, 49 frames: 109 s against 631 s.
 - `--video-decoder diffusion` (LTX 2.5 packs only, experimental) reproduces upstream's **default** `chunked_eager` stage-5 mode exactly: the neighborhood-attention stage runs on four width slabs with a halo, so the first/last ~20 px of each row are edge-replicated rather than attending over the full volume — identical to upstream's own default-mode output, not a port shortfall. Decodes above the memory budget are tiled automatically (`--diffvae-tile` to override); conv remains the default decoder.
