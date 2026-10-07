@@ -607,7 +607,7 @@ ltx-2-mlx generate \
   --auto-duration 2:6 --frame-rate 24 -o door.mp4
 ```
 
-**Mode recommendations for multi-anchor:** `--two-stage` or `--two-stages-hq` (dev model + CFG) respects anchors most faithfully. `--distilled` (8 steps, no CFG) also honors them — soft keyframe anchors are hints, not law, so the model may drift from them at longer durations, but a distilled start+end smoke test (512×512×25) tracked both anchors cleanly. `--one-stage` works but is slower than `--two-stage` at large resolutions.
+**Mode recommendations for multi-anchor:** `--two-stage` or `--two-stages-hq` (dev model + CFG) respects anchors most faithfully. `--distilled` (8 steps, no CFG) also honors them — soft keyframe anchors are hints, not law, so the model may drift from them at longer durations, but a distilled start+end smoke test (512×512×25) tracked both anchors cleanly, and so did a 768×512×97 comparison against `keyframe` on 2.5 (see the `keyframe` card in [docs/PIPELINES.md](docs/PIPELINES.md#keyframe)). `--one-stage` works but is slower than `--two-stage` at large resolutions.
 
 **Frame count grid:** frame counts live on the 8k+1 grid; an off-grid request is floored to it with a warning before any latent is sized (`snap_num_frames`, #177; e.g. 87 → 81). `hdr-ic-lora` instead rejects an off-grid source. Valid counts: 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 105, 113, 121, 129, 137, …
 
@@ -697,6 +697,7 @@ HQ params (LTX_2_3_HQ_PARAMS): `cfg_scale=3.0`, `stg_scale=0.0`, `stg_blocks=[]`
 ## Keyframe Interpolation Pipeline
 
 Two-stage pipeline requiring the dev (non-distilled) model + CFG. The distilled model hallucinates during interpolation.
+On 2.5 packs, `generate --distilled` with a start and an end `--image` is a faster alternative that tracked both images in a 768×512×97 comparison (numbers on the `keyframe` card in [docs/PIPELINES.md](docs/PIPELINES.md#keyframe)).
 
 ### Stage 1: Half Resolution + CFG
 1. Compute half-res latent dims: `H_half = (height//2) // 32`, `W_half = (width//2) // 32`
