@@ -40,7 +40,7 @@ packages/
 │       │
 │       ├── conditioning/                  # Latent conditioning system
 │       │   ├── mask_utils.py              # build/update/resolve attention masks
-│       │   ├── prompt_relay.py            # Prompt Relay (--segment) cross-attention mask
+│       │   ├── prompt_relay.py            # Prompt Relay (--segment) cross-attention masks (video + audio)
 │       │   └── types/
 │       │       ├── attention_strength_wrapper.py # Attention strength wrapping
 │       │       ├── latent_cond.py         # LatentState, VideoConditionByLatentIndex
@@ -562,7 +562,7 @@ Flags: `--two-stage` (Euler), `--two-stages-hq` (res_2s), `--cfg-scale` (default
 
 ### Prompt Relay (`--segment`)
 
-Community port (WhatDreamsCost/Kijai) — sequence local prompts over time within one generation. A training-free additive Gaussian penalty on the video→text cross-attention (`attn2`) gates each local prompt's token range to a slice of the timeline; the global `--prompt` still applies to every frame.
+Community port (WhatDreamsCost/Kijai) — sequence local prompts over time within one generation. A training-free additive Gaussian penalty on the text cross-attentions — video (`attn2`) and audio (`audio_attn2`), as the reference node patches both — gates each local prompt's token range to a slice of the timeline; the global `--prompt` still applies to every frame.
 
 ```bash
 ltx-2-mlx generate --distilled --prompt "cinematic, a woman in a bedroom" \
@@ -570,7 +570,7 @@ ltx-2-mlx generate --distilled --prompt "cinematic, a woman in a bedroom" \
   --segment "standing and turning to the window" --frame-rate 24 -o out.mp4
 ```
 
-Flags: `--segment "TEXT" [LEN_FRAMES]` (LEN_FRAMES in latent frames; repeatable, timeline order; omit LEN to auto-distribute), `--relay-epsilon` (default 1e-3, smaller = sharper), `--relay-strength` (default 1.0). Works on all `generate` modes; on CFG modes the mask applies to the **conditional pass only** (never the negative). **Not compatible with modality tiling** (raises). Correctness hinges on the Gemma connector front-packing valid tokens to column *i* (`_replace_padding_with_registers`) — token *i* in encode order → column *i* in the `Nk` axis. Inert on the default path (no `--segment` → `video_cross_attention_mask=None`, byte-identical output). Key files: `conditioning/prompt_relay.py`; `video_cross_attention_mask` kwarg threaded `LTXModel → BasicAVTransformerBlock → attn2`.
+Flags: `--segment "TEXT" [LEN_FRAMES]` (repeatable, timeline order; LEN in latent frames, omit to auto-distribute), `--relay-epsilon` (default 1e-3, smaller = sharper), `--relay-strength` (default 1.0, video penalty), `--relay-audio-strength` (default 1.0, audio penalty; `0` = video-only relay, exactly the pre-audio behaviour), `--relay-audio-epsilon` (default: `--relay-epsilon`). Works on all `generate` modes; on CFG modes the masks apply to the **positive passes only** (never the negative). **Not compatible with modality tiling** (raises). Correctness hinges on the Gemma connector front-packing valid tokens to column *i* (`_replace_padding_with_registers`) — token *i* in encode order → column *i* in the `Nk` axis. Inert on the default path (no `--segment` → both `video_cross_attention_mask` and `audio_cross_attention_mask` are `None`, byte-identical output). Key files: `conditioning/prompt_relay.py` (`build_relay_mask`, `build_relay_mask_audio`); `video_cross_attention_mask` / `audio_cross_attention_mask` kwargs threaded `LTXModel → BasicAVTransformerBlock → attn2` / `audio_attn2` by the four sampler loops; per-stage builders `BasePipeline._prompt_relay_mask_builder` / `_prompt_relay_audio_mask_builder`.
 
 **On 2.5 packs.** The Gemma-4 text encoder tokenizes with the pack's HuggingFace `tokenizer.json`, which (unlike the
 mlx-lm Gemma-3 tokenizer of the 2.3 packs) adds no `<bos>` and no `<eos>`; `map_token_ranges` measures with the same
@@ -602,6 +602,55 @@ between the two plateaus (half-width `L // 2 - 2`), so the global prompt alone d
 2.5 model already plays the two sentences in order (its native multishot) and turns at frame 46; on `--dfr` the auto
 split turns at frame 65 with or without relay, and a 3 / 10 split moves the turn to frame 47. Overhead: one mask build per stage (≈3 ms, 10 MB at 4,992 stage-2
 tokens), within the 1 s resolution of the step timer.
+
+**Audio (`audio_attn2`).** The reference node patches `audio_attn2` with the same segments. Audio tokens (25 per
+second) do not map to whole latent frames, so token *i* of `Na` sits at `i * F / Na` latent frames
+(`build_relay_mask_audio`, the reference's `build_temporal_cost_scaled`): same midpoints and plateau half-widths as the
+video mask, its own `--relay-audio-strength` (default 1.0, the reference's `audio_strength`, independent of
+`--relay-strength`) and `--relay-audio-epsilon` (default: inherit, as the reference's `audio_epsilon=0`). Inert on a
+frozen audio stream (`--two-stage` stage 2, a2v): `_prompt_relay_audio_mask_builder` builds nothing for it and the
+four loops drop the kwarg (`_audio_relay_mask`). `--relay-audio-strength 0` passes `None`, so a video-only relay is
+byte-identical to the relay before this flag existed.
+
+Validated on the 2.5 q8 pack (M4 Pro 48 GB, AC power, `--distilled` 512×768×97, seed 5, one run per arm): global
+"a woman in a kitchen, close-miked dialogue", segments `She … says: "Good morning!"` / `She waves goodbye and says:
+"See you tomorrow."`. Word timings from Whisper large-v3-turbo; segment boundary = first pixel frame (`8k - 7`) of the second
+segment's first latent frame `k`:
+
+| run | lengths | boundary | "Good morning" | "See you tomorrow" | SyncNet LSE-C / offset |
+|---|---|---:|---:|---:|---:|
+| no relay (combined prompt) | — | 2.04 s | 0.92–2.18 s | 2.66–3.52 s | 6.94 / 0 |
+| video relay (`--relay-audio-strength 0`) | 7 / 6 | 2.04 s | 1.00–2.20 s | 2.66–3.48 s | 6.51 / −1 |
+| video + audio relay | 7 / 6 | 2.04 s | 0.00–0.84 s | 2.24–3.22 s | 7.12 / −1 |
+| video relay | 4 / 9 | 1.04 s | 1.04–2.18 s | 2.62–3.52 s | 6.72 / −2 |
+| video + audio relay | 4 / 9 | 1.04 s | 0.00–0.76 s | 1.14–2.12 s | 6.07 / 0 |
+| video relay | 9 / 4 | 2.71 s | 1.06–2.20 s | 2.70–3.54 s | 6.43 / 0 |
+| video + audio relay | 9 / 4 | 2.71 s | 0.00–1.68 s | 2.44–3.46 s | 5.47 / −1 |
+
+The video-only relay leaves the speech where the model puts it whatever the boundary (the first line runs ~0.15 s
+past a 2.04 s boundary and lies entirely after a 1.04 s one); with the audio mask each line moves into its own segment and
+lip sync stays in range. One overlap: with 9 / 4 "See" starts 0.27 s before the video boundary (the audio mapping
+places latent frame 9 at 2.80 s, not 2.71 s, see the reference's mapping above). 8 s (512×768×193, 13 / 12 auto split,
+boundary 4.04 s): "See you tomorrow" at 6.39–7.22 s without relay, 4.44–5.74 s with the audio relay.
+
+**Cost.** Each mask is built once per stage on the CPU (video 3 ms / 10 MB bf16 at 4,992 tokens, 10 ms / 37 MB at
+17,856; audio 0.1 ms / 0.2 MB) and reused by every step, pass and block. Under `LTX2_COMPUTE_DTYPE=float16` it reaches
+`mx.fast.scaled_dot_product_attention` as float16 (`Attention._cast_inputs` clips it to float16's range: no overflow,
+the attention stays float16); on the default path the queries are float32 and the bf16 mask does not change the
+output dtype (checked by wrapping the kernel in real runs). A mask keeps the fused kernel; it costs an `attn2` call
++22 % in float32 (17.0 → 20.7 ms at 4,992 tokens) and +3 % in float16 (12.7 → 13.1 ms); `audio_attn2` calls are
+under 1 ms either way. Per step (M4 Pro, 512×768×97, steps 2+):
+
+| run | stage 1 s/step | stage 2 s/step | peak footprint |
+|---|---:|---:|---:|
+| no relay / video relay / video + audio relay | 7.21 / 7.36 / 7.36 | 29.25 / 29.15 / 29.65 | 25.7 GB |
+| `LTX2_COMPUTE_DTYPE=float16`: no relay / video + audio | 6.31 / 6.21 | 25.00 / 24.95 | 24.9 GB |
+| `LTX2_SOL_TAU=1.0,1.25,1.5`: no relay / video + audio | 7.21 / 7.34 | 26.50 / 26.90 | 25.8 GB |
+| `--low-ram`, video + audio | 7.49 | 29.15 | 22.4 GB |
+| 512×768×193: no relay / video + audio | 13.71 / 13.84 | 63.60 / 63.90 | 27.1 / 27.2 GB |
+
+The step timer has 1 s resolution over each stage, so differences under ~2 % are noise. Sol keeps running: 141
+stage-2 `attn1` calls ran sparse with and without the relay (the relay masks only `attn2` / `audio_attn2`).
 
 ### Negative prompt without CFG: NAG (`--nag`)
 
@@ -1502,7 +1551,7 @@ dtype on entry (like the conv decoder) and the same decode peaks at ~12 GB (5.8 
 | `hdr-ic-lora` | supported, **2.5 only** (upstream v1.4 SDR-to-HDR IC-LoRA, ACEScct); Experimental, validated end to end on real weights (see "HDR IC-LoRA Pipeline" › Status) |
 | `enhance` / `--enhance-prompt` | raises `NotImplementedError` (`_guard_enhance_not_gemma4`) — Gemma 3 only |
 | `--enable-teacache` | raises `ValueError` — 2.3 polynomial isn't calibrated for 2.5 |
-| Prompt Relay | supported — validated e2e on 2.5 `--distilled` and the `--dfr` base path (see "Prompt Relay"); token ranges pinned against the pack's Gemma-4 tokenizer |
+| Prompt Relay | supported — validated e2e on 2.5 `--distilled` and the `--dfr` base path (see "Prompt Relay"); token ranges pinned against the pack's Gemma-4 tokenizer; audio relay (`audio_attn2`) validated on 2.5 `--distilled` |
 | Modality tiling | validated on 2.5 `--distilled` (see "Position layout divergence" under Modality Tiling) |
 | NAG (`--nag`, negative prompt on `--distilled` / `--dfr`) | experimental — validated e2e on 2.5 `--distilled` and `--dfr` (see "Negative prompt without CFG: NAG") |
 | Generated keyframe slots (`--num-generated-keyframes N`) | supported on `generate` (the four non-DFR modes, stage 1 only; `--dfr` places its own); refused up front on 2.3 packs (no `use_keyframes_abs_pos_embedding`) |

@@ -283,9 +283,11 @@ would otherwise not fit. On a 32 GB Mac at typical token counts, prefer `--low-r
 | `--stepwise-interval N` | 1 | Preview every N denoising steps. The final step is always previewed. | with `--stepwise-image-output-dir` |
 | `--stepwise-frames N` | 8 | Latent frames per preview. The VAE upsamples time 8×, so N latent frames give 8N−7 pixel frames, about 2.3 s at the default. Cost is independent of clip length. `1` gives a single still. | with `--stepwise-image-output-dir` |
 | `--stepwise-frame I` | middle | Latent frame the preview window is centred on. Negative values count from the end. The middle is the default because frame 0 is the clean conditioning image on I2V runs. | with `--stepwise-image-output-dir` |
-| `--segment "TEXT" [LEN]` | — | Prompt Relay: a local prompt gated to a slice of the timeline, repeatable in timeline order. `LEN` is in latent frames. The global `--prompt` still applies everywhere. Validated on 2.3 and 2.5 packs. Not compatible with modality tiling. [Details](../CLAUDE.md#prompt-relay---segment). | `generate` modes |
+| `--segment "TEXT" [LEN]` | — | Prompt Relay: a local prompt gated to a slice of the timeline (video and audio), repeatable in timeline order. `LEN` is in latent frames. The global `--prompt` still applies everywhere. Validated on 2.3 and 2.5 packs. Not compatible with modality tiling. [Details](../CLAUDE.md#prompt-relay---segment). | `generate` modes |
 | `--relay-epsilon` | 1e-3 | Prompt Relay falloff. Smaller is sharper temporal gating. | with `--segment` |
-| `--relay-strength` | 1.0 | Prompt Relay penalty multiplier. Higher isolates segments more strictly. | with `--segment` |
+| `--relay-strength` | 1.0 | Prompt Relay penalty multiplier on the video cross-attention. Higher isolates segments more strictly. | with `--segment` |
+| `--relay-audio-strength` | 1.0 | Prompt Relay penalty multiplier on the audio cross-attention (`audio_attn2`), so each segment's speech and sounds stay near its slice of the timeline. `0` gates the video only (the behaviour before this flag existed). No effect on a frozen audio stream (`--two-stage` stage 2). | with `--segment` |
+| `--relay-audio-epsilon` | `--relay-epsilon` | Prompt Relay falloff of the audio penalty, in (0, 1). | with `--segment` |
 
 ## Flags by pipeline
 
@@ -338,6 +340,8 @@ are utilities and have no column.
 | `--segment` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `--relay-epsilon` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `--relay-strength` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `--relay-audio-strength` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `--relay-audio-epsilon` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `--input` | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
 | `--output-path` | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
 | `--hdr-lora` | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |

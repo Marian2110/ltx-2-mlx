@@ -103,6 +103,25 @@ def _frozen_sigma_kwargs(video_state: LatentState, audio_state: LatentState, bat
     return kwargs
 
 
+def _audio_relay_mask(mask: mx.array | None, audio_state: LatentState | None) -> mx.array | None:
+    """The Prompt Relay audio mask a loop should pass, or ``None`` for an absent or frozen audio stream.
+
+    A frozen stream is conditioning, not generated (its x0 is replaced by the clean latent),
+    so gating its prompt over time would only perturb the context the video reads through
+    the A->V cross-attention. The relay is inert there.
+
+    Args:
+        mask: Additive ``audio_attn2`` bias from the pipeline, or ``None``.
+        audio_state: Audio latent state, or ``None`` for a video-only run.
+
+    Returns:
+        ``mask`` when the audio stream is generated, else ``None``.
+    """
+    if mask is None or audio_state is None or audio_state.frozen:
+        return None
+    return mask
+
+
 def _nag_for_states(nag: NAGGuidance | None, audio_state: LatentState | None) -> NAGGuidance | None:
     """The NAG input a loop should pass: the audio negative is dropped for an absent or frozen audio stream.
 
@@ -142,6 +161,7 @@ def denoise_loop(
     video_attention_mask: mx.array | None = None,
     audio_attention_mask: mx.array | None = None,
     video_cross_attention_mask: mx.array | None = None,
+    audio_cross_attention_mask: mx.array | None = None,
     show_progress: bool = True,
     on_step: OnStepFn | None = None,
     nag: NAGGuidance | None = None,
@@ -161,6 +181,10 @@ def denoise_loop(
         audio_positions: Positional embeddings for audio.
         video_attention_mask: Attention mask for video.
         audio_attention_mask: Attention mask for audio.
+        video_cross_attention_mask: Optional Prompt Relay video->text cross-attention mask
+            (positive-context passes only).
+        audio_cross_attention_mask: Optional Prompt Relay audio->text cross-attention mask
+            (positive-context passes only; dropped when the audio state is frozen).
         show_progress: Whether to show tqdm progress bar.
         on_step: Optional per-step preview hook called as
             ``on_step(step_idx, num_steps, video_x0, sigma)`` with the
@@ -203,6 +227,7 @@ def denoise_loop(
     iterator = tqdm(steps, desc="Denoising", disable=not show_progress)
 
     # Determine whether we need per-token timesteps (for conditioning masks).
+    audio_cross_attention_mask = _audio_relay_mask(audio_cross_attention_mask, audio_state)
     nag = _nag_for_states(nag, audio_state)
     video_uniform = _is_uniform_mask(video_state.denoise_mask)
     audio_uniform = _is_uniform_mask(audio_state.denoise_mask) if has_audio else True
@@ -226,6 +251,8 @@ def denoise_loop(
         )
         if video_cross_attention_mask is not None:
             call_kwargs["video_cross_attention_mask"] = video_cross_attention_mask
+        if audio_cross_attention_mask is not None:
+            call_kwargs["audio_cross_attention_mask"] = audio_cross_attention_mask
         if nag is not None:
             call_kwargs["nag"] = nag
 
@@ -282,6 +309,7 @@ def euler_ancestral_denoising_loop(
     video_attention_mask: mx.array | None = None,
     audio_attention_mask: mx.array | None = None,
     video_cross_attention_mask: mx.array | None = None,
+    audio_cross_attention_mask: mx.array | None = None,
     show_progress: bool = True,
     on_step: OnStepFn | None = None,
     nag: NAGGuidance | None = None,
@@ -325,6 +353,8 @@ def euler_ancestral_denoising_loop(
         video_attention_mask: Attention mask for video.
         audio_attention_mask: Attention mask for audio.
         video_cross_attention_mask: Optional video->text cross-attention mask.
+        audio_cross_attention_mask: Optional audio->text cross-attention mask (dropped
+            when the audio state is frozen).
         show_progress: Whether to show tqdm progress bar.
         on_step: Optional per-step preview hook, see :func:`denoise_loop`.
         nag: Optional Normalized Attention Guidance, see :func:`denoise_loop`.
@@ -361,6 +391,7 @@ def euler_ancestral_denoising_loop(
     estimator.announce()
     iterator = tqdm(steps, desc="Denoising (ancestral)", disable=not show_progress)
 
+    audio_cross_attention_mask = _audio_relay_mask(audio_cross_attention_mask, audio_state)
     nag = _nag_for_states(nag, audio_state)
     video_uniform = _is_uniform_mask(video_state.denoise_mask)
     audio_uniform = _is_uniform_mask(audio_state.denoise_mask)
@@ -386,6 +417,8 @@ def euler_ancestral_denoising_loop(
         )
         if video_cross_attention_mask is not None:
             call_kwargs["video_cross_attention_mask"] = video_cross_attention_mask
+        if audio_cross_attention_mask is not None:
+            call_kwargs["audio_cross_attention_mask"] = audio_cross_attention_mask
         if nag is not None:
             call_kwargs["nag"] = nag
 
@@ -530,6 +563,7 @@ def res2s_denoise_loop(
     video_attention_mask: mx.array | None = None,
     audio_attention_mask: mx.array | None = None,
     video_cross_attention_mask: mx.array | None = None,
+    audio_cross_attention_mask: mx.array | None = None,
     show_progress: bool = True,
     bongmath: bool = True,
     bongmath_max_iter: int = 100,
@@ -566,6 +600,10 @@ def res2s_denoise_loop(
         audio_positions: Positional embeddings for audio.
         video_attention_mask: Attention mask for video.
         audio_attention_mask: Attention mask for audio.
+        video_cross_attention_mask: Optional Prompt Relay video->text cross-attention mask
+            (positive-context passes only).
+        audio_cross_attention_mask: Optional Prompt Relay audio->text cross-attention mask
+            (positive-context passes only; dropped when the audio state is frozen).
         show_progress: Whether to show tqdm progress bar.
         bongmath: Enable iterative anchor refinement for small steps.
         bongmath_max_iter: Max iterations for bong refinement.
@@ -597,6 +635,7 @@ def res2s_denoise_loop(
     video_x = video_state.latent.astype(mx.float32)
     audio_x = audio_state.latent.astype(mx.float32)
 
+    audio_cross_attention_mask = _audio_relay_mask(audio_cross_attention_mask, audio_state)
     video_uniform = _is_uniform_mask(video_state.denoise_mask)
     audio_uniform = _is_uniform_mask(audio_state.denoise_mask)
 
@@ -671,6 +710,8 @@ def res2s_denoise_loop(
         # Prompt Relay: positive-context passes only; overridden to None on uncond.
         if video_cross_attention_mask is not None:
             base_kwargs["video_cross_attention_mask"] = video_cross_attention_mask
+        if audio_cross_attention_mask is not None:
+            base_kwargs["audio_cross_attention_mask"] = audio_cross_attention_mask
         if not video_uniform:
             base_kwargs["video_timesteps"] = _compute_per_token_timesteps(sig, video_state.denoise_mask)
         if not audio_uniform:
@@ -705,6 +746,7 @@ def res2s_denoise_loop(
                     "video_text_embeds": neg_v_embeds,
                     "audio_text_embeds": neg_a_embeds,
                     "video_cross_attention_mask": None,  # never mask the negative prompt
+                    "audio_cross_attention_mask": None,
                 }
                 neg_v, neg_a = run_pass("uncond", neg_kw)
 
@@ -923,6 +965,7 @@ def guided_denoise_loop(
     video_attention_mask: mx.array | None = None,
     audio_attention_mask: mx.array | None = None,
     video_cross_attention_mask: mx.array | None = None,
+    audio_cross_attention_mask: mx.array | None = None,
     show_progress: bool = True,
     tap: TapFn | None = None,
     teacache=None,  # mlx_arsenal.diffusion.TeaCacheController-compatible
@@ -955,6 +998,10 @@ def guided_denoise_loop(
         audio_positions: Positional embeddings for audio.
         video_attention_mask: Attention mask for video.
         audio_attention_mask: Attention mask for audio.
+        video_cross_attention_mask: Optional Prompt Relay video->text cross-attention mask
+            (positive-context passes only).
+        audio_cross_attention_mask: Optional Prompt Relay audio->text cross-attention mask
+            (positive-context passes only; dropped when the audio state is frozen).
         show_progress: Whether to show tqdm progress bar.
         tap: Optional per-step instrumentation hook called as
             ``tap(step_idx, gate_signal, video_block_residual,
@@ -1018,6 +1065,7 @@ def guided_denoise_loop(
     iterator = tqdm(steps, desc="Denoising (guided)", disable=not show_progress)
 
     # Determine whether we need per-token timesteps (for conditioning masks).
+    audio_cross_attention_mask = _audio_relay_mask(audio_cross_attention_mask, audio_state)
     video_uniform = _is_uniform_mask(video_state.denoise_mask)
     audio_uniform = _is_uniform_mask(audio_state.denoise_mask)
 
@@ -1062,6 +1110,8 @@ def guided_denoise_loop(
         # which never masks the negative prompt.
         if video_cross_attention_mask is not None:
             base_kwargs["video_cross_attention_mask"] = video_cross_attention_mask
+        if audio_cross_attention_mask is not None:
+            base_kwargs["audio_cross_attention_mask"] = audio_cross_attention_mask
 
         # Per-token timesteps for conditioning
         if not video_uniform:
@@ -1148,6 +1198,7 @@ def guided_denoise_loop(
                 "video_text_embeds": neg_video_embeds,
                 "audio_text_embeds": neg_audio_embeds,
                 "video_cross_attention_mask": None,  # never mask the negative prompt
+                "audio_cross_attention_mask": None,
             }
             neg_video_x0, neg_audio_x0 = _run_pass("uncond", neg_kwargs)
 

@@ -146,6 +146,7 @@ class TI2VidTwoStagesHQPipeline(TI2VidTwoStagesPipeline):
         )
         num_text_tokens = video_embeds.shape[1]
         relay_mask = self._prompt_relay_mask_builder(prompt_relay, relay_token_ranges, num_text_tokens)
+        relay_audio_mask = self._prompt_relay_audio_mask_builder(prompt_relay, relay_token_ranges, num_text_tokens)
 
         # --- Load DiT + VAE encoder + upsampler ---
         if self.dit is None:
@@ -262,6 +263,7 @@ class TI2VidTwoStagesHQPipeline(TI2VidTwoStagesPipeline):
             video_guider_factory=video_factory,
             audio_guider_factory=audio_factory,
             video_cross_attention_mask=relay_mask(F, H_half, W_half, video_state.latent.shape[1]),
+            audio_cross_attention_mask=relay_audio_mask(F, audio_state),
             teacache=teacache_controller,
             tap=tap,
             on_step=self._stepwise_hook(F, H_half, W_half, stage=1),
@@ -358,6 +360,7 @@ class TI2VidTwoStagesHQPipeline(TI2VidTwoStagesPipeline):
             audio_text_embeds=audio_embeds,
             sigmas=sigmas_2,
             video_cross_attention_mask=relay_mask(F, H_full, W_full, video_state_2.latent.shape[1]),
+            audio_cross_attention_mask=relay_audio_mask(F, audio_state_2),
             on_step=self._stepwise_hook(F, H_full, W_full, stage=2),
         )
         if self.low_memory:
