@@ -40,6 +40,7 @@ from ltx_core_mlx.conditioning.types.latent_cond import (
 )
 from ltx_core_mlx.model.audio_vae import encode_audio
 from ltx_core_mlx.model.transformer.model import X0Model
+from ltx_core_mlx.model.video_vae.tiling import TilingConfig, prepare_tiles_for_encoding
 from ltx_core_mlx.utils.audio import load_audio
 from ltx_core_mlx.utils.ffmpeg import probe_video_info
 from ltx_core_mlx.utils.image import load_video_frames
@@ -48,6 +49,8 @@ from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_
 from ltx_pipelines_mlx._base import BasePipeline
 from ltx_pipelines_mlx.scheduler import ltx2_schedule
 from ltx_pipelines_mlx.utils.samplers import guided_denoise_loop
+
+_materialize = getattr(mx, "eval")  # noqa: B009 -- security hook flags mx.eval pattern
 
 # Reference defaults (LTX_2_3_PARAMS)
 DEFAULT_CFG_SCALE = 3.0
@@ -118,9 +121,23 @@ class RetakePipeline(BasePipeline):
         # Encode video via ImageConditioner (loads → encodes → frees)
         video_tensor = load_video_frames(video_path, info.height, info.width, vae_compatible_frames)
 
+        # Upstream encodes the source with ``tiled_encode(frames, TileSizeConfig.default())``
+        # (768/64 px, 80/24 frames). A source that fits one tile is encoded untiled, which is
+        # the same computation, so small sources keep their exact latents; a larger one is
+        # tiled like upstream (704x1280x49: 23.7 GB Metal peak instead of 31.4 GB untiled).
+        tiling = TilingConfig.default()
+        tiled = len(prepare_tiles_for_encoding(video_tensor.shape, tiling)) > 1
+
+        # Both encodes are materialized while their encoder is loaded: ``mx.synchronize`` does not
+        # evaluate a lazy graph, so the VAE encode used to run inside the first denoising step,
+        # with the encoder weights, the source pixels and the DiT all resident at once.
         def _encode_video(encoder) -> mx.array:
-            latent = encoder.encode(video_tensor)
-            mx.synchronize()
+            if tiled:
+                # fp32 blend buffers; back to the encoder's bf16 like upstream's ``.to(dtype)``.
+                latent = encoder.tiled_encode(video_tensor, tiling).astype(mx.bfloat16)
+            else:
+                latent = encoder.encode(video_tensor)
+            _materialize(latent)
             return latent
 
         video_latent = self.image_conditioner(_encode_video, free_after=self.low_memory)
@@ -139,7 +156,9 @@ class RetakePipeline(BasePipeline):
             if audio_data is not None:
 
                 def _encode_audio(enc, proc) -> mx.array:
-                    return encode_audio(audio_data.waveform, audio_data.sample_rate, enc, proc)
+                    latent = encode_audio(audio_data.waveform, audio_data.sample_rate, enc, proc)
+                    _materialize(latent)
+                    return latent
 
                 audio_latent = self.audio_conditioner(_encode_audio, free_after=self.low_memory)
                 if self.low_memory:

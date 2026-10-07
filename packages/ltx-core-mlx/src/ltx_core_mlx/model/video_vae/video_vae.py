@@ -944,6 +944,9 @@ class VideoEncoder(nn.Module):
 
             latent_buffer = _add_at(latent_buffer, tile.out_coords, latent_tile * mask)
             weights_buffer = _add_at(weights_buffer, tile.out_coords, mask)
+            # Encode this tile now: left lazy, every tile's activations are scheduled in one graph at the
+            # end (704x1280x121 with the default tiles: 38.5 GB Metal peak, 31.2 GB this way, same latents).
+            mx.eval(latent_buffer, weights_buffer)
 
             del latent_tile, mask, video_tile
             aggressive_cleanup()

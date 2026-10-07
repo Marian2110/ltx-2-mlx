@@ -647,6 +647,8 @@ ltx-2-mlx extend \
 
 Flags: `--steps` (default 30), `--cfg-scale` (default 3.0), `--stg-scale` (default 1.0), `--no-regen-audio` (retake only).
 
+Source encode (`RetakePipeline._encode_source_video`, retake and extend): the video and audio latents are evaluated while their encoder is loaded, before it is freed (`mx.synchronize` used to leave the VAE encode lazy, so it ran inside the first denoising step with the encoder, the source pixels and the DiT resident together). A source larger than one `TilingConfig.default()` tile (768/64 px, 80/24 frames) is encoded with `tiled_encode`, as upstream (`video_latent_from_file` → `tiled_encode(TileSizeConfig.default())`); a source that fits one tile keeps the untiled encode, the same computation. `VideoEncoder.tiled_encode` evaluates its accumulators after each tile instead of scheduling every tile in one graph at the end (same latents bit for bit; also used by `hdr-ic-lora`). Measured on an M1 Max 64 GB (2.5 q8): `retake` at 512×768×49 is byte-identical (sha256) to before, peak memory footprint 52.9 → 39.7 GB; the tiled encode of a 704×1280×121 source peaks at 31.2 GB Metal (38.5 GB without the per-tile evaluation; 704×1280×49: 31.4 GB untiled, 23.7 GB tiled).
+
 ### Training Example
 
 ```bash
