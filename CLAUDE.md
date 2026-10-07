@@ -430,7 +430,7 @@ Entry point: `uv run ltx-2-mlx <command>`. Available commands:
 | `ic-lora` | IC-LoRA | Stable | Two-stage generation with control video conditioning (depth, canny, pose, motion tracks) |
 | `hdr-ic-lora` | HDR IC-LoRA | Experimental | Single-stage ACEScct SDR-to-HDR IC-LoRA (LTX-2.5 packs only): HLG BT.2020 10-bit mp4 + ACEScg EXR frames. Takes `--input`, `--hdr-lora`, `--text-embeddings` (no prompt) |
 | `a2v` | Audio-to-video | Beta | Two-stage audio-conditioned generation (Euler + CFG). Sync quality depends on prompt-audio alignment. `--distilled` (Experimental): the distilled path, no CFG, input audio frozen in both stages |
-| `retake` | Retake | Beta | Regenerate a time segment of an existing video (dev model + CFG) |
+| `retake` | Retake | Beta | Regenerate a time segment of an existing video (dev model + CFG). `--distilled` (Experimental): the distilled model on the 8-step distilled table, no CFG (upstream's default retake mode) |
 | `extend` | Extend | Beta | Add frames before or after an existing video (dev model + CFG) |
 | `lipdub` | LipDub | Experimental | Lip-dub a reference video → re-sync visuals to source audio. Output audio is a VAE+vocoder reconstruction (audible artifacts on rich music). Uses pre-1.0 LipDub IC-LoRA. Stage 2 uses stage 1's generated audio as its reference (upstream Dub-It); the stage-1 reference is the source audio sliced or zero-padded to the clip window (#174). |
 | `enhance` | Prompt enhancement | Stable | Enhance a text prompt using Gemma (no video generation) |
@@ -439,7 +439,7 @@ Entry point: `uv run ltx-2-mlx <command>`. Available commands:
 | `preprocess` | Data preprocessing | Stable | Encode raw videos into latents + conditions for training |
 | `slice` | Training data | Stable | Slice long videos into normalized training clips (audio retained) |
 
-`generate --one-stage/--two-stage/--two-stages-hq`, `keyframe`, `a2v`, `retake` and `extend` use the dev model with CFG; `generate --distilled/--dfr`, `a2v --distilled`, `ic-lora` (unless `--dev-transformer`), `hdr-ic-lora` and `lipdub` use the distilled model without CFG. Common flags: `--model`, `--prompt`, `--output`, `--seed`, `--quiet` (`hdr-ic-lora` has its own set: no `--prompt`). CFG modes (`generate --one-stage/--two-stage/--two-stages-hq`, `keyframe`, `a2v`, `retake`, `extend`) take `--negative-prompt TEXT` (default: upstream `DEFAULT_NEGATIVE_PROMPT`; `""` is encoded verbatim; always one global prompt, even with `--segment`); `--distilled` / `--dfr` reject it (no CFG), and the distilled-sampler IC-LoRA family (`ic-lora`, `hdr-ic-lora`, `lipdub`) does not expose it. Every denoising stage prints an `[estimate]` work line (steps × passes × tokens = forwards) on stderr before step 1 and a time projection after the first computed step, refined once after the second (`utils/estimate.py`; retake/extend note that cost follows total clip length). Tier semantics + promotion criteria live in [docs/PIPELINE_MATURITY.md](docs/PIPELINE_MATURITY.md).
+`generate --one-stage/--two-stage/--two-stages-hq`, `keyframe`, `a2v`, `retake` and `extend` use the dev model with CFG; `generate --distilled/--dfr`, `a2v --distilled`, `retake --distilled`, `ic-lora` (unless `--dev-transformer`), `hdr-ic-lora` and `lipdub` use the distilled model without CFG. Common flags: `--model`, `--prompt`, `--output`, `--seed`, `--quiet` (`hdr-ic-lora` has its own set: no `--prompt`). CFG modes (`generate --one-stage/--two-stage/--two-stages-hq`, `keyframe`, `a2v`, `retake`, `extend`) take `--negative-prompt TEXT` (default: upstream `DEFAULT_NEGATIVE_PROMPT`; `""` is encoded verbatim; always one global prompt, even with `--segment`); `--distilled` / `--dfr` reject it (no CFG), and the distilled-sampler IC-LoRA family (`ic-lora`, `hdr-ic-lora`, `lipdub`) does not expose it. Every denoising stage prints an `[estimate]` work line (steps × passes × tokens = forwards) on stderr before step 1 and a time projection after the first computed step, refined once after the second (`utils/estimate.py`; retake/extend note that cost follows total clip length). Tier semantics + promotion criteria live in [docs/PIPELINE_MATURITY.md](docs/PIPELINE_MATURITY.md).
 
 ### Low-RAM Example
 
@@ -677,6 +677,15 @@ ltx-2-mlx extend \
 ```
 
 Flags: `--steps` (default 30), `--cfg-scale` (default 3.0), `--stg-scale` (default 1.0), `--no-regen-audio` (retake only).
+
+```bash
+# Distilled retake: upstream RetakePipeline's default mode (distilled model, no CFG)
+ltx-2-mlx retake --distilled \
+  --prompt "a different action" \
+  --video source.mp4 --start 2 --end 5 -o retake.mp4
+```
+
+`RetakePipeline(distilled=True)` encodes the prompt alone (`reject_negative_prompt` refuses a negative one), loads the distilled transformer the way `DistilledPipeline.load` resolves it (`transformer.safetensors`, else `transformer-distilled*.safetensors`, through `_load_transformer_with_optional_streaming`, so `--low-ram` and `LTX2_COMPUTE_DTYPE` apply) and runs `denoise_loop` on `shorten_schedule(DISTILLED_SIGMAS, steps, keep="start")`, like upstream's distilled retake (`DISTILLED_SIGMAS` + `SimpleDenoiser`, deterministic Euler; upstream does not switch retake to the ancestral sampler on 2.5 checkpoints, and an ancestral run of the same retake measured no difference). The window mask, the source noising and `--no-regen-audio` (audio frozen) are shared with the dev path, which is unchanged (`_guided_denoise` holds its guider setup). `extend` has no distilled mode yet and raises on a distilled pipeline. CLI: `--cfg-scale`, `--stg-scale` and `--negative-prompt` are rejected before anything loads; `--steps` defaults to the whole table (8). `LTX2_SOL_TAU` does not apply (one stage, no stage 2). Retake re-rolls the window; it follows a new action in the prompt only weakly (not a semantic editor). Validated (M1 Max, 2.5 q8, 7 Oct): at 512×768×49, seed 5, `retake --distilled` takes 148 s (14.4 s/step, Metal peak 23.4 GB) against 1793 s for `retake`, 120 s with `LTX2_COMPUTE_DTYPE=float16` (11.6 s/step), 148 s with `--low-ram` (22.4 GB footprint); 704×1280×121 float16: 695 s (76 s/step, 30.8 GB Metal peak while denoising), 716 s with `--low-ram` (9.5 GB while denoising). On an M4 Pro 48 GB the same 704×1280×121 float16 retake runs resident in 770 s.
 
 Source encode (`RetakePipeline._encode_source_video`, retake and extend): the video and audio latents are evaluated while their encoder is loaded, before it is freed (`mx.synchronize` used to leave the VAE encode lazy, so it ran inside the first denoising step with the encoder, the source pixels and the DiT resident together). A source larger than one `TilingConfig.default()` tile (768/64 px, 80/24 frames) is encoded with `tiled_encode`, as upstream (`video_latent_from_file` → `tiled_encode(TileSizeConfig.default())`); a source that fits one tile keeps the untiled encode, the same computation. `VideoEncoder.tiled_encode` evaluates its accumulators after each tile instead of scheduling every tile in one graph at the end (same latents bit for bit; also used by `hdr-ic-lora`). Measured on an M1 Max 64 GB (2.5 q8): `retake` at 512×768×49 is byte-identical (sha256) to before, peak memory footprint 52.9 → 39.7 GB; the tiled encode of a 704×1280×121 source peaks at 31.2 GB Metal (38.5 GB without the per-tile evaluation; 704×1280×49: 31.4 GB untiled, 23.7 GB tiled).
 
@@ -929,7 +938,7 @@ LTX-2.3 bf16 distilled, 480x704x33: confirmed runs end-to-end on M2 Pro 32 GB. W
 - `keyframe` (interpolation)
 - `ic-lora` (control video conditioning, via bind-time LoRA fusion)
 - `hdr-ic-lora` (HDR LoRA as a `BlockLoraSource`)
-- `retake` / `extend` (dev model + CFG; mirrors upstream RetakePipeline's `offload_mode`)
+- `retake` / `extend` (dev model + CFG; mirrors upstream RetakePipeline's `offload_mode`) and `retake --distilled`
 
 `lipdub` inherits the `ic-lora` path (its LoRA attaches as a `BlockLoraSource`). Validated on 2.3 q8 with the DubIt LoRA (576×320, 73-frame speaking reference, seed 5): 334 s streamed vs 305 s resident, 42.6 dB between the two outputs (the compiled-block ULP difference); at this small size the run's peak footprint (13.4 GB both) is set by text encoding, not the transformer.
 
@@ -1392,7 +1401,7 @@ dtype on entry (like the conv decoder) and the same decode peaks at ~12 GB (5.8 
 | `DurationHead` / auto-duration (`-f` optional) | supported — `-f` defaults to `AutoDuration()` on `--one-stage`/`--distilled`/`--two-stage`/`--two-stages-hq`/`--dfr`; `--auto-duration MIN:MAX` overrides the clamp. Absent on 2.3 packs, where omitting `-f` now raises immediately (see "Auto-Duration" above) |
 | `keyframe` | supported — validated e2e on 2.5 (deterministic, audio -38.3 dB; requires `--dev-transformer transformer-dev.safetensors`) |
 | `a2v` | supported — validated e2e on 2.5 (deterministic, conditioned audio faithfully reconstructed at -36.2 dB) |
-| `retake`, `extend` | supported — validated e2e on 2.5 (retake deterministic ×2; extend +N latent frames). `--low-ram` wired (mirrors upstream `offload_mode`): 49-frame retake that OOM'd now peaks at 13.8 GB |
+| `retake`, `extend` | supported — validated e2e on 2.5 (retake deterministic ×2; extend +N latent frames). `--low-ram` wired (mirrors upstream `offload_mode`): 49-frame retake that OOM'd now peaks at 13.8 GB. `retake --distilled` (Experimental): validated e2e on 2.5 q8 at 512×768×49 and 704×1280×121 (see Retake / Extend Example) |
 | `ic-lora`, `lipdub` | not yet supported (no official 2.5 task IC-LoRAs published yet) |
 | `hdr-ic-lora` | supported, **2.5 only** (upstream v1.4 SDR-to-HDR IC-LoRA, ACEScct); Experimental, validated end to end on real weights (see "HDR IC-LoRA Pipeline" › Status) |
 | `enhance` / `--enhance-prompt` | raises `NotImplementedError` (`_guard_enhance_not_gemma4`) — Gemma 3 only |
@@ -1659,7 +1668,7 @@ How it works (`model/transformer/sparse_attention.py`):
   perturbation, cross-attention, or fewer than 4096 tokens stay dense.
 - `DistilledPipeline._stage2` turns it on around the stage-2 loop and off afterwards (also on error), so it covers
   `generate --distilled` and the stage 2 of `generate --dfr`. Stage 1, the DFR temporal rounds and spatial epilogue, and
-  the other pipelines are untouched. Under `--low-ram` the streamed model attaches the state to whichever block is bound
+  the other pipelines (single-stage `retake --distilled` included) are untouched. Under `--low-ram` the streamed model attaches the state to whichever block is bound
   and runs the eager shared block while it is on (the compiled block would replay the tau and routing of the step it
   was traced on).
 
