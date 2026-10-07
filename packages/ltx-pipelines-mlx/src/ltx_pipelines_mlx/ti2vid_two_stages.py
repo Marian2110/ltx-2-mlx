@@ -26,6 +26,7 @@ from ltx_core_mlx.components.patchifiers import (
     snap_output_dimensions,
 )
 from ltx_core_mlx.conditioning.types.keyframe_slots import extract_generated_keyframes
+from ltx_core_mlx.guidance.nag import NAGConfig
 from ltx_core_mlx.loader.fuse_loras import apply_loras
 from ltx_core_mlx.loader.primitives import LoraStateDictWithStrength, StateDict
 from ltx_core_mlx.loader.sd_ops import LTXV_LORA_COMFY_RENAMING_MAP
@@ -754,6 +755,7 @@ class TI2VidTwoStagesPipeline(BasePipeline):
         prompt_relay=None,
         generated_keyframes: int | Sequence[int] = 0,
         negative_prompt: str | None = None,
+        nag: NAGConfig | None = None,
     ) -> str:
         """Generate two-stage video+audio and save to file.
 
@@ -766,7 +768,10 @@ class TI2VidTwoStagesPipeline(BasePipeline):
 
         ``negative_prompt`` is likewise forwarded only when set, so subclasses
         whose ``generate_two_stage`` lacks the kwarg keep working. CFG-less
-        subclasses (distilled, DFR) raise ``ValueError`` when it is set.
+        subclasses (distilled, DFR) raise ``ValueError`` when it is set without ``nag``.
+
+        ``nag`` (Normalized Attention Guidance, the CFG-less subclasses only) is forwarded
+        only when set, too.
         """
         gen_kwargs: dict = dict(
             prompt=prompt,
@@ -791,6 +796,8 @@ class TI2VidTwoStagesPipeline(BasePipeline):
             gen_kwargs["prompt_relay"] = prompt_relay
         if negative_prompt is not None:
             gen_kwargs["negative_prompt"] = negative_prompt
+        if nag is not None:
+            gen_kwargs["nag"] = nag
         if has_generated_keyframes(generated_keyframes):
             gen_kwargs["generated_keyframes"] = generated_keyframes
         video_latent, audio_latent = self.generate_two_stage(**gen_kwargs)

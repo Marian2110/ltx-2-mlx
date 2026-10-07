@@ -15,6 +15,7 @@ from tqdm import tqdm
 from ltx_core_mlx.components.diffusion_steps import EulerAncestralDiffusionStep
 from ltx_core_mlx.components.guiders import MultiModalGuiderFactory
 from ltx_core_mlx.conditioning.types.latent_cond import LatentState, apply_denoise_mask
+from ltx_core_mlx.guidance.nag import NAGGuidance
 from ltx_core_mlx.guidance.perturbations import (
     BatchedPerturbationConfig,
     Perturbation,
@@ -102,6 +103,26 @@ def _frozen_sigma_kwargs(video_state: LatentState, audio_state: LatentState, bat
     return kwargs
 
 
+def _nag_for_states(nag: NAGGuidance | None, audio_state: LatentState | None) -> NAGGuidance | None:
+    """The NAG input a loop should pass: the audio negative is dropped for an absent or frozen audio stream.
+
+    A frozen stream is conditioning, not generated (its x0 is replaced by the clean latent), so
+    guiding its cross-attention would only perturb what the video reads from it through A->V.
+
+    Args:
+        nag: NAG input from the pipeline, or ``None``.
+        audio_state: Audio latent state, or ``None`` for a video-only run.
+
+    Returns:
+        ``nag``, without its audio context when the audio stream is not generated.
+    """
+    if nag is None or nag.audio_text_embeds is None:
+        return nag
+    if audio_state is None or audio_state.frozen:
+        return nag._replace(audio_text_embeds=None)
+    return nag
+
+
 def _step_timed(estimator: StepEstimator, step_idx: int, video_x: mx.array, audio_x: mx.array | None) -> None:
     """Feed one completed step to the estimator, syncing only for the step it times."""
     if estimator.wants_sync:
@@ -123,6 +144,7 @@ def denoise_loop(
     video_cross_attention_mask: mx.array | None = None,
     show_progress: bool = True,
     on_step: OnStepFn | None = None,
+    nag: NAGGuidance | None = None,
 ) -> DenoiseOutput:
     """Run the Euler denoising loop for joint audio+video.
 
@@ -144,6 +166,8 @@ def denoise_loop(
             ``on_step(step_idx, num_steps, video_x0, sigma)`` with the
             mask-blended x0 prediction. Used for stepwise previews. Has no
             effect on control flow.
+        nag: Optional Normalized Attention Guidance (distilled negative prompt), passed to
+            every forward; its audio context is dropped when the audio state is frozen.
 
     Returns:
         DenoiseOutput with final video and audio latents.
@@ -179,6 +203,7 @@ def denoise_loop(
     iterator = tqdm(steps, desc="Denoising", disable=not show_progress)
 
     # Determine whether we need per-token timesteps (for conditioning masks).
+    nag = _nag_for_states(nag, audio_state)
     video_uniform = _is_uniform_mask(video_state.denoise_mask)
     audio_uniform = _is_uniform_mask(audio_state.denoise_mask) if has_audio else True
 
@@ -201,6 +226,8 @@ def denoise_loop(
         )
         if video_cross_attention_mask is not None:
             call_kwargs["video_cross_attention_mask"] = video_cross_attention_mask
+        if nag is not None:
+            call_kwargs["nag"] = nag
 
         # Pass per-token timesteps when mask is not uniform
         if not video_uniform:
@@ -257,6 +284,7 @@ def euler_ancestral_denoising_loop(
     video_cross_attention_mask: mx.array | None = None,
     show_progress: bool = True,
     on_step: OnStepFn | None = None,
+    nag: NAGGuidance | None = None,
 ) -> DenoiseOutput:
     """Run the ancestral (SDE) Euler denoising loop for joint audio+video.
 
@@ -299,6 +327,7 @@ def euler_ancestral_denoising_loop(
         video_cross_attention_mask: Optional video->text cross-attention mask.
         show_progress: Whether to show tqdm progress bar.
         on_step: Optional per-step preview hook, see :func:`denoise_loop`.
+        nag: Optional Normalized Attention Guidance, see :func:`denoise_loop`.
 
     Returns:
         DenoiseOutput with final video and audio latents.
@@ -332,6 +361,7 @@ def euler_ancestral_denoising_loop(
     estimator.announce()
     iterator = tqdm(steps, desc="Denoising (ancestral)", disable=not show_progress)
 
+    nag = _nag_for_states(nag, audio_state)
     video_uniform = _is_uniform_mask(video_state.denoise_mask)
     audio_uniform = _is_uniform_mask(audio_state.denoise_mask)
 
@@ -356,6 +386,8 @@ def euler_ancestral_denoising_loop(
         )
         if video_cross_attention_mask is not None:
             call_kwargs["video_cross_attention_mask"] = video_cross_attention_mask
+        if nag is not None:
+            call_kwargs["nag"] = nag
 
         # Pass per-token timesteps when mask is not uniform
         if not video_uniform:

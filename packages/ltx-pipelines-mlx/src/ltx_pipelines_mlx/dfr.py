@@ -43,6 +43,7 @@ from ltx_core_mlx.components.modality_tiling import TiledLTXModel, VideoModality
 from ltx_core_mlx.conditioning.types.keyframe_cond import VideoConditionByKeyframeIndex
 from ltx_core_mlx.conditioning.types.keyframe_slots import VideoGeneratedKeyframeSlots, extract_generated_keyframes
 from ltx_core_mlx.conditioning.types.latent_cond import VideoConditionByLatentIndex
+from ltx_core_mlx.guidance.nag import NAGConfig
 from ltx_core_mlx.loader import (
     LTXV_LORA_BLOCK_PREFIX,
     LTXV_LORA_COMFY_RENAMING_MAP,
@@ -60,7 +61,7 @@ from ltx_core_mlx.model.video_vae.tiling import DimensionTilingConfig, TileCount
 from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_token_count, compute_video_positions
 from ltx_core_mlx.utils.weights import apply_quantization
-from ltx_pipelines_mlx._base import reject_negative_prompt, unfused_loras_requested
+from ltx_pipelines_mlx._base import resolve_distilled_nag, unfused_loras_requested
 from ltx_pipelines_mlx.dfr_layout import (
     TemporalTilePlan,
     TilePrefix,
@@ -607,6 +608,7 @@ class DFRPipeline(DistilledPipeline):
         generated_keyframes: int | Sequence[int] = 0,
         enable_teacache: bool = False,
         negative_prompt: str | None = None,
+        nag: NAGConfig | None = None,
         **_unused_kwargs,
     ) -> tuple[mx.array, mx.array]:
         """DFR base path; returns ``(video_latent, audio_latent)`` trimmed to ``num_frames``.
@@ -625,7 +627,11 @@ class DFRPipeline(DistilledPipeline):
             prompt_relay: Optional Prompt Relay segment specs.
             generated_keyframes: Must stay falsy — DFR places its own slots.
             enable_teacache: Must stay ``False`` — not available on the DFR path.
-            negative_prompt: Must stay ``None`` — DFR runs the distilled flow (no CFG).
+            negative_prompt: Applied through NAG when ``nag`` is set, refused otherwise — DFR
+                runs the distilled flow (no CFG).
+            nag: Normalized Attention Guidance settings, as on
+                :meth:`DistilledPipeline.generate_two_stage`: stage 1, stage 2, the temporal
+                rounds and the spatial epilogue all run with the negative prompt.
             **_unused_kwargs: Accepted (and ignored) for signature compatibility with
                 :meth:`DistilledPipeline.generate_two_stage`.
 
@@ -635,13 +641,13 @@ class DFRPipeline(DistilledPipeline):
         Raises:
             ValueError: on a pack without the keyframe embedding, when ``generated_keyframes``
                 is passed (DFR places its own slots from the canvas), when TeaCache is requested
-                or when ``negative_prompt`` is set (no CFG).
+                when ``negative_prompt`` is set without ``nag`` (no CFG) or ``nag`` without it.
             FileNotFoundError: when the detailing LoRA cannot be resolved (raised up front,
                 before any prompt encoding).
             RuntimeError: when ``_stage1`` did not run the canvas hook, leaving the requested
                 duration unknown.
         """
-        reject_negative_prompt(negative_prompt, type(self).__name__)
+        nag = resolve_distilled_nag(negative_prompt, nag, type(self).__name__)
         if generated_keyframes:
             raise ValueError("DFR places its keyframe slots from the canvas; --num-generated-keyframes does not apply")
         if enable_teacache:
@@ -703,6 +709,8 @@ class DFRPipeline(DistilledPipeline):
             enable_teacache=False,
             canvas_for=canvas_for,
             video_fps=conditioning_fps(frame_rate),
+            negative_prompt=negative_prompt,
+            nag=nag,
         )
         if not requested:
             raise RuntimeError(
@@ -884,6 +892,7 @@ class DFRPipeline(DistilledPipeline):
             sigmas=TEMPORAL_SIGMAS,
             stepper=EulerAncestralDiffusionStep(eta=TEMPORAL_ANCESTRAL_ETA),
             noise_seed=noise_seed,
+            **({} if stage1.nag is None else {"nag": stage1.nag}),
         )
         slots = extract_generated_keyframes(
             output.video_latent, video_state.generated_keyframe_layout, self.video_patchifier, (H, W)
@@ -1148,6 +1157,7 @@ class DFRPipeline(DistilledPipeline):
                 seed=seed,
                 ancestral=self._is_25,
                 noise_seed_offset=noise_seed_offset,
+                nag=stage1.nag,
             )
         out = self.video_patchifier.unpatchify(output.video_latent[:, : F * H * W, :], (F, H, W))
         _materialize(out)

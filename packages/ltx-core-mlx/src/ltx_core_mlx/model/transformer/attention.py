@@ -14,6 +14,12 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
+from ltx_core_mlx.guidance.nag import (
+    DEFAULT_NAG_ALPHA,
+    DEFAULT_NAG_SCALE,
+    DEFAULT_NAG_TAU,
+    normalized_attention_guidance,
+)
 from ltx_core_mlx.model.transformer.rope import apply_rope_interleaved, apply_rope_split
 from ltx_core_mlx.model.transformer.sparse_attention import SparseAttentionState, sparse_self_attention
 
@@ -115,6 +121,10 @@ class Attention(nn.Module):
         rope_freqs_k: mx.array | None = None,
         attention_mask: mx.array | None = None,
         perturbation_mask: mx.array | None = None,
+        nag_encoder_hidden_states: mx.array | None = None,
+        nag_scale: float = DEFAULT_NAG_SCALE,
+        nag_alpha: float = DEFAULT_NAG_ALPHA,
+        nag_tau: float = DEFAULT_NAG_TAU,
     ) -> mx.array:
         """Forward pass.
 
@@ -123,16 +133,30 @@ class Attention(nn.Module):
             encoder_hidden_states: Cross-attention keys/values if not None.
             rope_freqs: RoPE frequencies for Q (and K if rope_freqs_k is None).
             rope_freqs_k: Separate RoPE frequencies for K (cross-attention).
-            attention_mask: Optional mask broadcastable to (B, 1, Nq, Nk).
+            attention_mask: Optional mask broadcastable to (B, 1, Nq, Nk). With NAG it masks
+                the positive attention only.
+            perturbation_mask: Optional STG mask, see the STG note below.
+            nag_encoder_hidden_states: Negative context for Normalized Attention Guidance
+                (cross-attention only), ``(1 or B, Nk', kv_dim)``. ``None`` (default) is the
+                plain attention. The same queries attend to it unmasked, and the two outputs
+                are combined by :func:`~ltx_core_mlx.guidance.nag.normalized_attention_guidance`
+                (float32) before the per-head gate and the output projection.
+            nag_scale: NAG extrapolation factor (used with ``nag_encoder_hidden_states``).
+            nag_alpha: NAG blend with the positive output.
+            nag_tau: NAG clip on the per-token L1-norm ratio.
 
         Returns:
             Output of shape (B, N, out_dim).
         """
         B, N, _ = x.shape
+        if nag_encoder_hidden_states is not None and encoder_hidden_states is None:
+            raise ValueError("NAG needs a cross-attention (encoder_hidden_states is None)")
         if self.compute_dtype is not None:
             x, encoder_hidden_states, attention_mask, perturbation_mask = _cast_inputs(
                 self.compute_dtype, x, encoder_hidden_states, attention_mask, perturbation_mask
             )
+            if nag_encoder_hidden_states is not None:
+                nag_encoder_hidden_states = nag_encoder_hidden_states.astype(self.compute_dtype)
         kv_input = encoder_hidden_states if encoder_hidden_states is not None else x
 
         q = self.to_q(x)
@@ -177,6 +201,19 @@ class Attention(nn.Module):
             ).transpose(0, 2, 1, 3)
         else:
             out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=attention_mask)
+
+        # NAG: the same queries against the negative context (no mask: Prompt Relay gates the
+        # positive prompt only), combined with the positive output over all heads per token.
+        if nag_encoder_hidden_states is not None:
+            k_neg = self.k_norm(self.to_k(nag_encoder_hidden_states))
+            v_neg = self.to_v(nag_encoder_hidden_states)
+            k_neg = k_neg.reshape(k_neg.shape[0], -1, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+            v_neg = v_neg.reshape(v_neg.shape[0], -1, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+            if k_neg.shape[0] != B:
+                k_neg = mx.broadcast_to(k_neg, (B, *k_neg.shape[1:]))
+                v_neg = mx.broadcast_to(v_neg, (B, *v_neg.shape[1:]))
+            out_neg = mx.fast.scaled_dot_product_attention(q, k_neg, v_neg, scale=self.scale)
+            out = normalized_attention_guidance(out, out_neg, nag_scale, nag_alpha, nag_tau, axis=(1, 3))
 
         # STG perturbation: blend attn output with value projection
         # Reference: out = attn_out * mask + v * (1 - mask)

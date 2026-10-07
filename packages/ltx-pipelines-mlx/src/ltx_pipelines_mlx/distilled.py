@@ -34,6 +34,7 @@ from ltx_core_mlx.components.patchifiers import (
 )
 from ltx_core_mlx.conditioning.types.keyframe_slots import extract_generated_keyframes
 from ltx_core_mlx.conditioning.types.latent_cond import LatentState
+from ltx_core_mlx.guidance.nag import NAGConfig, NAGGuidance
 from ltx_core_mlx.model.transformer.model import X0Model
 from ltx_core_mlx.model.transformer.sparse_attention import SparseAttentionState
 from ltx_core_mlx.model.upsampler import LatentUpsampler
@@ -43,7 +44,7 @@ from ltx_core_mlx.utils.positions import (
     compute_audio_token_count,
     compute_video_positions,
 )
-from ltx_pipelines_mlx._base import reject_negative_prompt
+from ltx_pipelines_mlx._base import resolve_distilled_nag
 from ltx_pipelines_mlx.utils.args import ImageConditioningInput, resolve_frame_indices
 from ltx_pipelines_mlx.utils.helpers import generated_keyframe_conditionings
 
@@ -95,6 +96,8 @@ class Stage1Result:
         relay_mask: Prompt Relay cross-attention mask builder.
         x0_model: The stage 1 X0 model, reused for stage 2 when tiling is off; ``None`` once
             released (DFR drops it before its temporal rounds reload a clean DiT).
+        nag: Normalized Attention Guidance input (encoded negative prompt + settings) for every
+            stage of the run, or ``None`` when NAG is off.
     """
 
     video_tokens: mx.array
@@ -106,6 +109,7 @@ class Stage1Result:
     audio_embeds: mx.array
     relay_mask: Callable
     x0_model: X0Model | None
+    nag: NAGGuidance | None = None
 
 
 def resolve_stage1_frames(
@@ -224,6 +228,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
         seed: int,
         ancestral: bool,
         noise_seed_offset: int,
+        nag: NAGGuidance | None = None,
     ):
         """Dispatch one stage onto the deterministic or ancestral (SDE) loop.
 
@@ -243,7 +248,11 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
         ``noise_seed``): positions and attention masks are resolved from the
         :class:`LatentState` by both, so the call structure is otherwise the
         one already used at the 2.3 call sites.
+
+        ``nag`` (Normalized Attention Guidance) is passed to the loop only when set, so a run
+        without it makes exactly the loop calls it made before NAG existed.
         """
+        nag_kwargs = {} if nag is None else {"nag": nag}
         if not ancestral:
             return denoise_loop(
                 model=model,
@@ -254,6 +263,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
                 sigmas=sigmas,
                 video_cross_attention_mask=video_cross_attention_mask,
                 on_step=on_step,
+                **nag_kwargs,
             )
 
         return euler_ancestral_denoising_loop(
@@ -267,6 +277,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             noise_seed=seed + noise_seed_offset,
             video_cross_attention_mask=video_cross_attention_mask,
             on_step=on_step,
+            **nag_kwargs,
         )
 
     def _start_stage2_sparse_attention(self, sigmas: list[float]) -> SparseAttentionState | None:
@@ -366,6 +377,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
         generated_keyframes: int | Sequence[int] = 0,
         enable_teacache: bool = False,
         negative_prompt: str | None = None,
+        nag: NAGConfig | None = None,
         **_unused_kwargs,
     ) -> tuple[mx.array, mx.array]:
         """Generate video using the distilled two-stage pipeline.
@@ -388,8 +400,12 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
                 :meth:`TI2VidTwoStagesPipeline.generate_two_stage`. Ignored on
                 LTX-2.3 packs (the 8-step distilled flow has never used
                 TeaCache); rejected on LTX-2.5 packs.
-            negative_prompt: Must stay ``None`` — the distilled flow has no CFG,
-                so a negative prompt is refused rather than silently ignored.
+            negative_prompt: Applied through NAG when ``nag`` is set; refused otherwise
+                (the distilled flow has no CFG, and a negative prompt is not silently
+                ignored or silently given another meaning).
+            nag: Normalized Attention Guidance settings: the negative prompt acts inside the
+                text cross-attentions of both stages, without an unconditional pass.
+                ``None`` (default) keeps the plain distilled flow.
             **_unused_kwargs: Accepted (and ignored) for signature compatibility
                 with :meth:`TI2VidTwoStagesPipeline.generate_two_stage`. CFG / STG
                 flags don't apply to the distilled flow.
@@ -399,9 +415,10 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
 
         Raises:
             ValueError: when ``enable_teacache`` is requested on an LTX-2.5 pack,
-                or when ``negative_prompt`` is set (no CFG).
+                when ``negative_prompt`` is set without ``nag`` (no CFG), or ``nag``
+                without ``negative_prompt``.
         """
-        reject_negative_prompt(negative_prompt, type(self).__name__)
+        nag = resolve_distilled_nag(negative_prompt, nag, type(self).__name__)
         stage1, num_frames, height, width = self._stage1(
             prompt,
             height,
@@ -415,6 +432,8 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             prompt_relay=prompt_relay,
             generated_keyframes=generated_keyframes,
             enable_teacache=enable_teacache,
+            negative_prompt=negative_prompt,
+            nag=nag,
         )
         video_half = self.video_patchifier.unpatchify(stage1.video_tokens, stage1.latent_dims)
         video_upscaled = self._upsample_latent(video_half)
@@ -445,6 +464,8 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
         enable_teacache: bool,
         canvas_for: Callable[[int], tuple[int, list[int]]] | None = None,
         video_fps: float | None = None,
+        negative_prompt: str | None = None,
+        nag: NAGConfig | None = None,
     ) -> tuple[Stage1Result, int, int, int]:
         """Encode the prompt and denoise stage 1 at half resolution.
 
@@ -473,6 +494,10 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
                 (``compute_video_positions``, ``combined_image_conditionings``,
                 ``generated_keyframe_conditionings``). ``None`` (every caller except
                 :class:`DFRPipeline`) uses ``frame_rate`` -- byte-identical to before.
+            negative_prompt: NAG negative prompt, encoded right after the prompt when ``nag``
+                is set (already validated by :func:`resolve_distilled_nag`).
+            nag: Active NAG settings, or ``None``. The encoded guidance is returned in
+                ``Stage1Result.nag`` for stage 2 and the DFR passes.
 
         Returns:
             Tuple of (stage1 result, resolved num_frames, resolved height, resolved width).
@@ -500,6 +525,8 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
         with phase("Encoding prompt", verbose=self.verbose):
             video_embeds, audio_embeds = self._encode_text(encode_prompt)
             _materialize(video_embeds, audio_embeds)
+        # NAG: the negative prompt is one global prompt (Prompt Relay gates the positive only).
+        nag_guidance = None if nag is None else self._encode_nag(negative_prompt, nag)
         num_frames = self._resolve_num_frames(
             num_frames, video_encoding=video_embeds, audio_encoding=audio_embeds, frame_rate=frame_rate
         )
@@ -596,6 +623,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             seed=seed,
             ancestral=self._is_25,
             noise_seed_offset=ANCESTRAL_NOISE_SEED_OFFSET,
+            nag=nag_guidance,
         )
         if self.low_memory:
             aggressive_cleanup()
@@ -618,6 +646,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
                 audio_embeds=audio_embeds,
                 relay_mask=relay_mask,
                 x0_model=x0_model,
+                nag=nag_guidance,
             ),
             num_frames,
             height,
@@ -759,6 +788,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
                 seed=seed,
                 ancestral=self._is_25,
                 noise_seed_offset=ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET,
+                nag=stage1.nag,
             )
         finally:
             self._stop_stage2_sparse_attention(sparse)

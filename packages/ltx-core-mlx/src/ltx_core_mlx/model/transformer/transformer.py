@@ -21,6 +21,7 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
+from ltx_core_mlx.guidance.nag import NAGGuidance
 from ltx_core_mlx.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from ltx_core_mlx.model.transformer.adaln import PerTokenAdaLNParams
 from ltx_core_mlx.model.transformer.attention import Attention
@@ -53,6 +54,16 @@ def cast_float_params(params: dict, dtype: mx.Dtype) -> dict:
         return value
 
     return _cast(params)
+
+
+def _nag_kwargs(nag: NAGGuidance, negative_context: mx.array) -> dict:
+    """``Attention`` keyword arguments for one NAG-guided text cross-attention."""
+    return {
+        "nag_encoder_hidden_states": negative_context,
+        "nag_scale": nag.scale,
+        "nag_alpha": nag.alpha,
+        "nag_tau": nag.tau,
+    }
 
 
 class BasicAVTransformerBlock(nn.Module):
@@ -293,6 +304,7 @@ class BasicAVTransformerBlock(nn.Module):
         video_cross_attention_mask: mx.array | None = None,
         perturbations: BatchedPerturbationConfig | None = None,
         block_idx: int = 0,
+        nag: NAGGuidance | None = None,
     ) -> tuple[mx.array, mx.array | None]:
         """Forward pass for the joint audio+video block, or video-only when ``audio_hidden`` is None.
 
@@ -322,6 +334,9 @@ class BasicAVTransformerBlock(nn.Module):
                 for perturbed samples in the batch.
             block_idx: Index of this block in the transformer stack, used for
                 per-block perturbation lookup.
+            nag: Optional Normalized Attention Guidance input. Its negative contexts get the
+                same per-step prompt AdaLN modulation as the positive ones and are handed to
+                ``attn2`` (and ``audio_attn2`` when ``nag.audio_text_embeds`` is set).
 
         Returns:
             Tuple of (video_hidden, audio_hidden); audio_hidden is None on the video-only path.
@@ -407,12 +422,16 @@ class BasicAVTransformerBlock(nn.Module):
             video_normed = self._rms_norm(video_hidden) * (1.0 + v_scale_ca) + v_shift_ca
             vp_shift, vp_scale = self._unpack_adaln(video_prompt_adaln_params, self.prompt_scale_shift_table, 2, vdim)
             text_scaled = video_text_embeds * (1.0 + vp_scale) + vp_shift
+            nag_kwargs = {}
+            if nag is not None:
+                nag_kwargs = _nag_kwargs(nag, nag.video_text_embeds * (1.0 + vp_scale) + vp_shift)
             video_hidden = (
                 video_hidden
                 + self.attn2(
                     video_normed,
                     encoder_hidden_states=text_scaled,
                     attention_mask=video_cross_attention_mask,
+                    **nag_kwargs,
                 )
                 * v_gate_ca
             )
@@ -424,7 +443,18 @@ class BasicAVTransformerBlock(nn.Module):
                 audio_prompt_adaln_params, self.audio_prompt_scale_shift_table, 2, adim
             )
             text_scaled = audio_text_embeds * (1.0 + ap_scale) + ap_shift
-            audio_hidden = audio_hidden + self.audio_attn2(audio_normed, encoder_hidden_states=text_scaled) * a_gate_ca
+            nag_kwargs = {}
+            if nag is not None and nag.audio_text_embeds is not None:
+                nag_kwargs = _nag_kwargs(nag, nag.audio_text_embeds * (1.0 + ap_scale) + ap_shift)
+            audio_hidden = (
+                audio_hidden
+                + self.audio_attn2(
+                    audio_normed,
+                    encoder_hidden_states=text_scaled,
+                    **nag_kwargs,
+                )
+                * a_gate_ca
+            )
 
         if run_audio:
             # --- 5-6. Audio-Video cross-modal attention ---

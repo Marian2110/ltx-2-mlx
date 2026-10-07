@@ -196,9 +196,71 @@ def _add_negative_prompt_arg(parser: argparse.ArgumentParser) -> None:
         help=(
             "Negative prompt for CFG: what should not appear in the video. Default: the upstream "
             "DEFAULT_NEGATIVE_PROMPT (common artifacts and quality issues). An empty string "
-            'encodes "" verbatim. CFG pipelines only: rejected by --distilled and --dfr.'
+            'encodes "" verbatim. CFG pipelines only: rejected by --distilled and --dfr '
+            "unless --nag is set."
         ),
     )
+
+
+def _add_nag_args(parser: argparse.ArgumentParser) -> None:
+    """Add the NAG flags (``generate --distilled`` / ``--dfr``)."""
+    parser.add_argument(
+        "--nag",
+        action="store_true",
+        help=(
+            "[experimental] Normalized Attention Guidance: apply --negative-prompt on --distilled / --dfr, which "
+            "have no CFG. The negative prompt acts inside the text cross-attentions (video and audio) instead of "
+            "through an unconditional pass: a few percent per step instead of 2x. Requires --negative-prompt."
+        ),
+    )
+    parser.add_argument(
+        "--nag-scale",
+        type=float,
+        default=None,
+        help="NAG extrapolation factor, >= 1 (1 = no effect). Default: 11.0 (kijai's LTX2_NAG node).",
+    )
+    parser.add_argument(
+        "--nag-alpha",
+        type=float,
+        default=None,
+        help="NAG blend of the guided output with the plain one, in [0, 1]. Default: 0.25.",
+    )
+    parser.add_argument(
+        "--nag-tau",
+        type=float,
+        default=None,
+        help="NAG clip on how far the guided output's L1 norm may grow over the plain one's. Default: 2.5.",
+    )
+    parser.add_argument(
+        "--nag-video-only",
+        action="store_true",
+        help="Guide only the video cross-attention (attn2); leave the audio one (audio_attn2) unguided.",
+    )
+
+
+def _build_nag_config(args: argparse.Namespace):
+    """Validate the NAG flags of ``generate`` and build its ``NAGConfig`` (``None`` without ``--nag``)."""
+    tuning = {
+        "--nag-scale": args.nag_scale,
+        "--nag-alpha": args.nag_alpha,
+        "--nag-tau": args.nag_tau,
+        "--nag-video-only": args.nag_video_only or None,
+    }
+    if not args.nag:
+        given = [flag for flag, value in tuning.items() if value is not None]
+        if given:
+            raise SystemExit(f"{', '.join(given)} only apply with --nag.")
+        return None
+    if not (args.distilled or args.dfr):
+        raise SystemExit(
+            "--nag applies to --distilled and --dfr (no CFG). The CFG modes use --negative-prompt through CFG."
+        )
+    if args.negative_prompt is None:
+        raise SystemExit("--nag needs --negative-prompt: NAG guides away from that prompt.")
+    from ltx_core_mlx.guidance.nag import NAGConfig
+
+    overrides = {"scale": args.nag_scale, "alpha": args.nag_alpha, "tau": args.nag_tau}
+    return NAGConfig(**{k: v for k, v in overrides.items() if v is not None}, audio=not args.nag_video_only)
 
 
 def _add_teacache_args(parser: argparse.ArgumentParser) -> None:
@@ -462,6 +524,7 @@ examples:
   ltx-2-mlx generate --prompt "a sunset" --distilled -f 97 --frame-rate 24 --output sunset.mp4
   ltx-2-mlx generate --prompt "animate" --image photo.jpg --two-stage -f 97 --frame-rate 24 -o anim.mp4
   ltx-2-mlx generate --prompt "a scene" --two-stage -f 97 --frame-rate 24 -o hires.mp4
+  ltx-2-mlx generate --prompt "a vlogger talking" --distilled --nag --negative-prompt "microphone" -f 97 --frame-rate 24 -o nag.mp4
   ltx-2-mlx a2v --prompt "music video" --audio music.wav --frame-rate 24 -o a2v.mp4
   ltx-2-mlx retake --prompt "new scene" --video source.mp4 --start 1 --end 3 -o out.mp4
   ltx-2-mlx extend --prompt "continue" --video source.mp4 --extend-frames 2 -o out.mp4
@@ -668,6 +731,7 @@ examples:
     gen.add_argument("--stage2-steps", type=int, default=None, help="Stage 2 steps (default: 3)")
     gen.add_argument("--cfg-scale", type=float, default=None, help="CFG guidance scale (default: 3.0)")
     _add_negative_prompt_arg(gen)
+    _add_nag_args(gen)
     gen.add_argument(
         "--stg-scale",
         type=float,
@@ -1246,6 +1310,8 @@ def _cmd_generate(args: argparse.Namespace) -> None:
     # Fail fast on the diffusion decoder's preconditions: both would otherwise only
     # surface after the whole generation, at decode time.
     _require_diffusion_decoder_preconditions(args, args.model)
+    # NAG flags are validated (and NAGConfig built) before any model work, prompt enhancement included.
+    nag = _build_nag_config(args)
 
     prompt = _maybe_enhance_prompt(args)
 
@@ -1288,8 +1354,8 @@ def _cmd_generate(args: argparse.Namespace) -> None:
             raise SystemExit("--spatial-upscalings 2 does not support --segment (Prompt Relay).")
         if args.spatial_upscalings == 2 and _build_tile_count_config(args) is not None:
             raise SystemExit("--spatial-upscalings 2 does not support --tile-frames / --tile-spatial.")
-        if args.negative_prompt is not None:
-            raise SystemExit("--dfr runs the distilled flow (no CFG); drop --negative-prompt.")
+        if args.negative_prompt is not None and not args.nag:
+            raise SystemExit("--dfr runs the distilled flow (no CFG); drop --negative-prompt or add --nag.")
     else:
         if args.detailing_lora != DEFAULT_DETAILING_LORA:
             raise SystemExit("--detailing-lora only applies with --dfr.")
@@ -1299,9 +1365,10 @@ def _cmd_generate(args: argparse.Namespace) -> None:
             raise SystemExit("--temporal-upscalings only applies with --dfr.")
         if args.temporal_upsampler_path is not None:
             raise SystemExit("--temporal-upsampler-path only applies with --dfr.")
-    if args.distilled and args.negative_prompt is not None:
+    if args.distilled and args.negative_prompt is not None and not args.nag:
         raise SystemExit(
-            "--distilled has no CFG; --negative-prompt requires --one-stage, --two-stage or --two-stages-hq."
+            "--distilled has no CFG; --negative-prompt requires --one-stage, --two-stage or --two-stages-hq, "
+            "or --nag (Normalized Attention Guidance)."
         )
 
     if args.one_stage:
@@ -1399,6 +1466,8 @@ def _cmd_generate(args: argparse.Namespace) -> None:
             kwargs["stage2_steps"] = args.stage2_steps
         if relay is not None:
             kwargs["prompt_relay"] = relay
+        if nag is not None:
+            kwargs.update(negative_prompt=args.negative_prompt, nag=nag)
         pipe.generate_and_save(**kwargs)
 
     elif args.distilled:
@@ -1439,6 +1508,8 @@ def _cmd_generate(args: argparse.Namespace) -> None:
             kwargs["stage2_steps"] = args.stage2_steps
         if relay is not None:
             kwargs["prompt_relay"] = relay
+        if nag is not None:
+            kwargs.update(negative_prompt=args.negative_prompt, nag=nag)
         pipe.generate_and_save(**kwargs)
 
     elif args.two_stages_hq or args.two_stage:

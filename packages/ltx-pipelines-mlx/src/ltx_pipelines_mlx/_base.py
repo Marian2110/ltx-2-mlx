@@ -19,6 +19,7 @@ import mlx.core as mx
 
 from ltx_core_mlx.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
 from ltx_core_mlx.conditioning.types.latent_cond import LatentState
+from ltx_core_mlx.guidance.nag import NAGConfig, NAGGuidance
 from ltx_core_mlx.loader.lora_adapters import lora_mode_from_env
 from ltx_core_mlx.model.audio_vae.audio_vae import AudioVAEDecoder
 from ltx_core_mlx.model.audio_vae.bwe import VocoderWithBWE
@@ -109,8 +110,36 @@ def reject_negative_prompt(negative_prompt: str | None, pipeline_name: str) -> N
         raise ValueError(
             f"negative_prompt requires a CFG pipeline; {pipeline_name} uses the distilled "
             "sampler (no classifier-free guidance). Use a dev pipeline (one-stage, two-stage, "
-            "two-stages-hq) or drop negative_prompt."
+            "two-stages-hq), pass nag=NAGConfig() to apply it through Normalized Attention "
+            "Guidance, or drop negative_prompt."
         )
+
+
+def resolve_distilled_nag(negative_prompt: str | None, nag: NAGConfig | None, pipeline_name: str) -> NAGConfig | None:
+    """Validate a negative prompt on a CFG-less (distilled) pipeline, before any model load.
+
+    Without CFG the only way a negative prompt acts is NAG, which is opt-in: ``negative_prompt``
+    without ``nag`` is refused (:func:`reject_negative_prompt`) rather than silently switched to
+    a different mechanism, and ``nag`` without ``negative_prompt`` has nothing to guide away from.
+
+    Args:
+        negative_prompt: The user-supplied negative prompt (``None`` = not set; ``""`` is a prompt).
+        nag: The NAG settings, or ``None`` (NAG off).
+        pipeline_name: Pipeline class name, used in the error messages.
+
+    Returns:
+        ``nag`` when it is set and active, ``None`` when NAG is off or ``nag.scale == 1``
+        (the identity: nothing is encoded or computed).
+
+    Raises:
+        ValueError: On a negative prompt without NAG, or NAG without a negative prompt.
+    """
+    if nag is None:
+        reject_negative_prompt(negative_prompt, pipeline_name)
+        return None
+    if negative_prompt is None:
+        raise ValueError(f"nag needs a negative_prompt on {pipeline_name}: NAG guides away from that prompt.")
+    return nag if nag.active else None
 
 
 class BasePipeline:
@@ -726,6 +755,19 @@ class BasePipeline:
         self.load()
 
         return video_embeds, audio_embeds
+
+    def _encode_nag(self, negative_prompt: str, config: NAGConfig) -> NAGGuidance:
+        """Encode the NAG negative prompt and bind it to ``config`` (text encoder already loaded).
+
+        Materialized on its own, after the positive prompt, for the same watchdog reason as
+        :meth:`_encode_text_with_negative`. One encode per run: every step and both stages
+        reuse the result.
+        """
+        _materialize = getattr(mx, "eval")  # noqa: B009 -- mx.eval is the MLX graph materialiser
+        with phase("Encoding NAG negative prompt", verbose=self.verbose):
+            neg_video_embeds, neg_audio_embeds = self._encode_text(negative_prompt)
+            _materialize(neg_video_embeds, neg_audio_embeds)
+        return NAGGuidance.from_config(config, neg_video_embeds, neg_audio_embeds)
 
     def _encode_text(self, prompt: str) -> tuple[mx.array, mx.array]:
         """Encode prompt to (video, audio) embeddings via the PromptEncoder block.

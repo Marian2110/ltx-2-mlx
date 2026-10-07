@@ -50,6 +50,7 @@ packages/
 │       │       └── reference_video_cond.py # VideoConditionByReferenceLatent (IC-LoRA)
 │       │
 │       ├── guidance/                      # Guidance utilities
+│       │   ├── nag.py                     # NAG (negative prompt without CFG): NAGConfig, NAGGuidance, the combine
 │       │   └── perturbations.py           # Noise perturbation strategies
 │       │
 │       ├── loader/                        # Weight loading & LoRA fusion
@@ -440,7 +441,7 @@ Entry point: `uv run ltx-2-mlx <command>`. Available commands:
 | `preprocess` | Data preprocessing | Stable | Encode raw videos into latents + conditions for training |
 | `slice` | Training data | Stable | Slice long videos into normalized training clips (audio retained) |
 
-`generate --one-stage/--two-stage/--two-stages-hq`, `keyframe`, `a2v`, `retake` and `extend` use the dev model with CFG; `generate --distilled/--dfr`, `a2v --distilled`, `retake --distilled`, `extend --distilled`, `ic-lora` (unless `--dev-transformer`), `hdr-ic-lora` and `lipdub` use the distilled model without CFG. Common flags: `--model`, `--prompt`, `--output`, `--seed`, `--quiet` (`hdr-ic-lora` has its own set: no `--prompt`). CFG modes (`generate --one-stage/--two-stage/--two-stages-hq`, `keyframe`, `a2v`, `retake`, `extend`) take `--negative-prompt TEXT` (default: upstream `DEFAULT_NEGATIVE_PROMPT`; `""` is encoded verbatim; always one global prompt, even with `--segment`); `--distilled` / `--dfr` reject it (no CFG), and the distilled-sampler IC-LoRA family (`ic-lora`, `hdr-ic-lora`, `lipdub`) does not expose it. Every denoising stage prints an `[estimate]` work line (steps × passes × tokens = forwards) on stderr before step 1 and a time projection after the first computed step, refined once after the second (`utils/estimate.py`; retake/extend note that cost follows total clip length). Tier semantics + promotion criteria live in [docs/PIPELINE_MATURITY.md](docs/PIPELINE_MATURITY.md).
+`generate --one-stage/--two-stage/--two-stages-hq`, `keyframe`, `a2v`, `retake` and `extend` use the dev model with CFG; `generate --distilled/--dfr`, `a2v --distilled`, `retake --distilled`, `extend --distilled`, `ic-lora` (unless `--dev-transformer`), `hdr-ic-lora` and `lipdub` use the distilled model without CFG. Common flags: `--model`, `--prompt`, `--output`, `--seed`, `--quiet` (`hdr-ic-lora` has its own set: no `--prompt`). CFG modes (`generate --one-stage/--two-stage/--two-stages-hq`, `keyframe`, `a2v`, `retake`, `extend`) take `--negative-prompt TEXT` (default: upstream `DEFAULT_NEGATIVE_PROMPT`; `""` is encoded verbatim; always one global prompt, even with `--segment`); `--distilled` / `--dfr` reject it (no CFG) unless `--nag` applies it through Normalized Attention Guidance (see "Negative prompt without CFG" below), and the distilled-sampler IC-LoRA family (`ic-lora`, `hdr-ic-lora`, `lipdub`) does not expose it. Every denoising stage prints an `[estimate]` work line (steps × passes × tokens = forwards) on stderr before step 1 and a time projection after the first computed step, refined once after the second (`utils/estimate.py`; retake/extend note that cost follows total clip length). Tier semantics + promotion criteria live in [docs/PIPELINE_MATURITY.md](docs/PIPELINE_MATURITY.md).
 
 ### Low-RAM Example
 
@@ -602,6 +603,88 @@ between the two plateaus (half-width `L // 2 - 2`), so the global prompt alone d
 split turns at frame 65 with or without relay, and a 3 / 10 split moves the turn to frame 47. Overhead: one mask build per stage (≈3 ms, 10 MB at 4,992 stage-2
 tokens), within the 1 s resolution of the step timer.
 
+### Negative prompt without CFG: NAG (`--nag`)
+
+Experimental. Normalized Attention Guidance ([paper code](https://github.com/ChenDarYen/Normalized-Attention-Guidance),
+LTX-2 port: kijai's `LTX2_NAG` node in `ComfyUI-KJNodes/nodes/ltxv_nodes.py`) applies a negative prompt on the distilled
+paths, which run at CFG 1 and have no unconditional pass to extrapolate from. Inside every text cross-attention
+(`attn2`, and `audio_attn2` unless `--nag-video-only`) the queries attend to the positive and to the negative context;
+the two outputs are combined per token before the per-head gate and `to_out`:
+
+```
+z~ = z+ * s - z- * (s - 1);  r = ||z~||_1 / ||z+||_1 (over all heads);  z^ = z~ * min(1, tau / r);  z = alpha * z^ + (1 - alpha) * z+
+```
+
+```bash
+ltx-2-mlx generate --distilled --nag --negative-prompt "mouth opened very wide, exaggerated mouth movements" \
+  -p "..." -H 768 -W 512 -f 97 --frame-rate 24 -o out.mp4
+```
+
+Flags: `--nag` (needs `--negative-prompt`; `--distilled` and `--dfr` only, refused on the CFG modes), `--nag-scale` (11.0,
+`>= 1`, `1` = off), `--nag-alpha` (0.25), `--nag-tau` (2.5), `--nag-video-only`; the defaults are the node's. Without
+`--nag`, `--negative-prompt` stays refused on the distilled paths (it is not silently given another mechanism), and both
+`nag` kwargs stay `None`: renders are byte-identical. Python: `generate_two_stage(..., negative_prompt=..., nag=NAGConfig())`
+on `DistilledPipeline` / `DFRPipeline`. Every pass of the run is guided: both stages, and on `--dfr` the temporal rounds
+and the spatial epilogue.
+
+How it runs: the negative prompt is encoded once per run (`BasePipeline._encode_nag`, right after the prompt, +5.5 s on
+the 2.5 pack) and travels as one `NAGGuidance` (a `NamedTuple`, so it crosses the `--low-ram` compiled block) through
+`Stage1Result.nag` → the Euler / ancestral loops → `LTXModel` → `BasicAVTransformerBlock` → `Attention`
+(`nag_encoder_hidden_states`). The block gives the negative context the same per-step prompt AdaLN modulation as the
+positive (`prompt_scale_shift_table`), then the attention projects its K/V (once per block per step; the modulation
+depends on sigma, so it cannot be hoisted) and runs a second `scaled_dot_product_attention` with the same queries and
+**no mask** (Prompt Relay gates the positive prompt only). The combine runs in float32 whatever the compute dtype and
+returns the attention's dtype. The loops drop the audio negative for an absent or frozen audio stream. Sol
+(`LTX2_SOL_TAU`) is untouched: it covers `attn1` (141 stage-2 calls ran sparse with and without NAG).
+
+Differences from the node, deliberate: (1) the node hands its patched forward the raw connector output, so on 2.3 / 2.5
+checkpoints (`cross_attention_adaln`) its negative skips the modulation the positive gets; here both are modulated (on
+the mouth test below the node's variant reduced the mean opening less, 0.243 → 0.172 against 0.145, and its largest
+opening, 0.457, exceeded the unguided render's); (2) float32 combine (an L1 sum over 4,096 features overflows float16);
+(3) `scale == 1` is off (the paper's `nag_scale > 1` gate) where the node uses `0`; (4) no NAG with CFG (the node allows
+both), the audio negative comes from the same prompt (the node takes an optional separate audio conditioning).
+
+Validated on the 2.5 q8 pack (M4 Pro 48 GB, AC power, `--distilled` 768×512×97, one run per arm). Mouth opening = inner-lip
+gap / distance between the eye centres (insightface 3D-68 landmarks, every frame), negative `"mouth opened very wide,
+exaggerated mouth movements, screaming"`:
+
+| prompt, seed | off: mean / max / frames > 0.30 | NAG: mean / max / frames > 0.30 | Whisper WER off / NAG | SyncNet LSE-C off / NAG |
+|---|---|---|---|---|
+| man laughing "No way, we actually did it!", 5 | 0.243 / 0.435 / 19.6 % | 0.145 / 0.352 / 3.1 % | 0 / 0 | 6.14 / 4.75 |
+| same, 11 | 0.169 / 0.298 / 0 % | 0.099 / 0.260 / 0 % | 0 / 0 | 4.66 / 4.23 |
+| vlogger "Hi everyone, welcome back…", 5 | 0.199 / 0.458 / 15.5 % | 0.185 / 0.433 / 12.4 % | — | — |
+| same, 11 | 0.222 / 0.441 / 22.7 % | 0.136 / 0.320 / 3.1 % | — | — |
+
+The opening shrinks on all four; the speech is unchanged and the lips still follow it, with a lower sync confidence (smaller
+mouth movements). A hands prompt (counting on the fingers, negative `"extra fingers, missing fingers, fused fingers,
+distorted hands"`) changed the gestures but not the motion-blurred, merged fingers: NAG does not fix hands here. No harm on
+an ordinary clip (kitchen dialogue, negative `"blurry, distorted hands, extra fingers, deformed face"`, seed 5): WER 0 in
+all three arms (off / NAG / NAG video-only), LSE-C 6.94 / 7.10 / 6.83, the same audio level (−27.7 / −26.7 / −27.8 dB);
+the NAG render is a different sample (lighter, softer look; MUSIQ 73.3 / 65.1 / 67.8, DOVER 0.859 / 0.854 / 0.860; `--nag-scale 5`
+scores the same MUSIQ, 65.0). On seed 11 the words were the same and the NAG render was louder (−27.1 → −20.7 dB).
+
+Cost (steps 2+, the step timer has 1 s resolution):
+
+| run | stage 1 s/step off → NAG | stage 2 s/step off → NAG | whole render | peak footprint |
+|---|---:|---:|---:|---:|
+| `--distilled` (float32 compute) | 7.36 → 8.36 (+14 %) | 29.20 → 31.25 (+7 %) | 175 → 194 s | 25.7 → 25.6 GB |
+| `--nag-video-only` | → 8.10 | → 30.85 | 193 s | 25.8 GB |
+| `LTX2_COMPUTE_DTYPE=float16` | 6.21 → 7.24 | 24.95 → 26.60 | 154 → 171 s | 24.9 → 25.4 GB |
+| `LTX2_SOL_TAU=1.0,1.25,1.5` | 7.36 → 8.36 | 26.45 → 28.50 | 167 → 199 s | 25.8 → 25.8 GB |
+| `--low-ram` | 7.41 → 8.46 | 29.20 → 30.80 | 171 → 192 s | 22.4 → 23.2 GB |
+| with `--segment` (Prompt Relay; measured with the audio mask on as well) | 7.34 → 8.36 | 29.60 → 31.65 | 176 → 195 s | 25.7 → 25.6 GB |
+| `--dfr` 768×512×49 | 5.09 → 6.10 | 23.95 → 26.05 | 149 → 160 s | 39.3 → 39.0 GB |
+
+The extra work is a second K/V projection of the 1,024-token text context and a second attention per cross-attention call,
+so its share falls as the video grows: one `attn2` call (micro-benchmark, random q8 weights) costs +17.7 ms at 1,248
+video tokens (×1.57), +36 ms at 4,992 (×1.41), +99 ms at 17,856 (×1.35), i.e. +0.85 / +1.7 / +4.8 s per 48-block forward;
+`audio_attn2` +3–4 ms. Float16 margin on real weights: the largest |value| entering or leaving the combine was 434, with
+no non-finite output; the tau clip acted on 26–38 % of the tokens.
+
+Key files: `guidance/nag.py` (`NAGConfig`, `NAGGuidance`, `normalized_attention_guidance`), `model/transformer/attention.py`
+(`nag_encoder_hidden_states`), `transformer.py` (modulation), `utils/samplers.py` (`_nag_for_states`), `_base.py`
+(`resolve_distilled_nag`, `_encode_nag`). Tests: `tests/test_nag.py`.
+
 ### Multi-Anchor I2V (`--image` repeatable)
 
 All `generate` modes (`--one-stage`, `--two-stage`, `--two-stages-hq`, `--distilled`, `--dfr`) support multiple `--image` flags. Each anchor takes `PATH FRAME_IDX STRENGTH` where `FRAME_IDX` is the **pixel frame index** (0-based; for a 97-frame video the last frame is 96).
@@ -741,6 +824,8 @@ HQ params (LTX_2_3_HQ_PARAMS): `cfg_scale=3.0`, `stg_scale=0.0`, `stg_blocks=[]`
 **`stg_scale` defaults differ by pipeline**: the dev + CFG pipelines (`--two-stage`, `--one-stage`, `a2v`, `keyframe`, `retake`/`extend`) default to `stg_scale=1.0` (`ti2vid_two_stages.py:408`, `retake.py:54` `DEFAULT_STG_SCALE`; guidance params in `utils/constants.py`); `--two-stages-hq` defaults to `stg_scale=0.0` (`ti2vid_two_stages_hq.py:113`). STG requires a 3rd forward pass per step. On 32GB Mac, this causes OOM for videos longer than ~33 frames at 480x704. Pass `--stg-scale 0` on 32GB machines for long clips.
 
 **Memory impact**: Each extra pass doubles/triples/quadruples memory. On 32GB Mac with dev model at 480x704: CFG-only supports ~97 frames at half-res (two-stage), full guidance (4 passes) supports ~17 frames.
+
+**Distilled paths (CFG 1)**: no unconditional pass; a negative prompt acts only through NAG (`--nag`, inside the text cross-attentions; see "Negative prompt without CFG: NAG").
 
 **STG perturbation masks**: Self-attention masks are 4D `(B,1,1,1)` for use inside attention where tensors are `(B,H,N,D)`. Cross-modal masks (A2V/V2A) are 3D `(B,1,1)` for use outside attention where outputs are `(B,N,dim)`. Mixing these up causes silent shape corruption via broadcasting.
 
@@ -1419,6 +1504,7 @@ dtype on entry (like the conv decoder) and the same decode peaks at ~12 GB (5.8 
 | `--enable-teacache` | raises `ValueError` — 2.3 polynomial isn't calibrated for 2.5 |
 | Prompt Relay | supported — validated e2e on 2.5 `--distilled` and the `--dfr` base path (see "Prompt Relay"); token ranges pinned against the pack's Gemma-4 tokenizer |
 | Modality tiling | validated on 2.5 `--distilled` (see "Position layout divergence" under Modality Tiling) |
+| NAG (`--nag`, negative prompt on `--distilled` / `--dfr`) | experimental — validated e2e on 2.5 `--distilled` and `--dfr` (see "Negative prompt without CFG: NAG") |
 | Generated keyframe slots (`--num-generated-keyframes N`) | supported on `generate` (the four non-DFR modes, stage 1 only; `--dfr` places its own); refused up front on 2.3 packs (no `use_keyframes_abs_pos_embedding`) |
 | DFR (`DFRPipeline`) | complete — shipped as `generate --dfr`: base path (spatial detailing with the official 2.5 detailing IC-LoRA), keyframe-aware decode on `--video-decoder diffusion`, temporal rounds (`--temporal-upscalings {1,2}`), and the spatial epilogue (`--spatial-upscalings {1,2}`) |
 | Diffusion video decoder | opt-in `--video-decoder diffusion` (experimental; tiled automatically above the decode budget, `--diffvae-tile` override); conv remains default |

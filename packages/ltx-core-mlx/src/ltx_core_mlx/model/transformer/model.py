@@ -26,6 +26,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as _np
 
+from ltx_core_mlx.guidance.nag import NAGGuidance
 from ltx_core_mlx.guidance.perturbations import BatchedPerturbationConfig
 from ltx_core_mlx.model.transformer.adaln import AdaLayerNormSingle, PerTokenAdaLNParams
 from ltx_core_mlx.model.transformer.sparse_attention import SparseAttentionState
@@ -792,6 +793,7 @@ class LTXModel(nn.Module):
         block_provider: callable | None = None,
         video_sigma: mx.array | None = None,
         audio_sigma: mx.array | None = None,
+        nag: NAGGuidance | None = None,
     ) -> tuple[mx.array, mx.array]:
         """Forward pass.
 
@@ -840,6 +842,10 @@ class LTXModel(nn.Module):
             audio_sigma: Optional (B,) sigma of the audio modality. Drives the
                 audio prompt AdaLN and the A->V cross-attention gate. ``None``
                 = ``timestep``. A frozen audio stream passes 0.
+            nag: Optional Normalized Attention Guidance (negative prompt without CFG): its
+                negative contexts are cast like the positive ones and broadcast to every
+                block's ``attn2`` / ``audio_attn2``. ``None`` (default) is the plain forward.
+                The audio context is unused on the video-only path (no ``audio_attn2`` runs).
 
         Returns:
             Tuple of (video_velocity, audio_velocity), same shapes as inputs.
@@ -858,6 +864,12 @@ class LTXModel(nn.Module):
             video_text_embeds = video_text_embeds.astype(mx.bfloat16)
         if audio_text_embeds is not None:
             audio_text_embeds = audio_text_embeds.astype(mx.bfloat16)
+        if nag is not None:
+            nag_audio = nag.audio_text_embeds
+            nag = nag._replace(
+                video_text_embeds=nag.video_text_embeds.astype(mx.bfloat16),
+                audio_text_embeds=None if nag_audio is None else nag_audio.astype(mx.bfloat16),
+            )
 
         # Embed patches
         video_hidden = self.patchify_proj(video_latent)
@@ -1019,6 +1031,7 @@ class LTXModel(nn.Module):
                             video_cross_attention_mask=video_cross_attention_mask,
                             perturbations=perturbations,
                             block_idx=_bidx,
+                            nag=nag,
                         )
 
                     video_hidden, audio_hidden = mx.checkpoint(_run_block)(
@@ -1048,6 +1061,7 @@ class LTXModel(nn.Module):
                     video_cross_attention_mask=video_cross_attention_mask,
                     perturbations=perturbations,
                     block_idx=block_idx,
+                    nag=nag,
                 )
                 if block_provider is not None:
                     # Streaming: force MLX graph materialization between

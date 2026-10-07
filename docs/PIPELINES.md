@@ -36,7 +36,7 @@ Everything else is in [Common flags](#common-flags).
 - **Produces:** T2V / I2V mp4 with audio. Half-res distilled pass, 2× latent upsample, 3-step distilled refine.
 - **Packs:** 2.3 and 2.5. On 2.5 both stages use the ancestral sampler (stage-2 noise seeded from `seed + 20000`); 2.3 stays deterministic Euler. **Tier:** Stable.
 - **Required:** `--prompt`, `--output`, `--frame-rate`. `--frames` is required on 2.3 packs and auto-predicted on 2.5.
-- **Own flags:** `--stage1-steps` (8), `--stage2-steps` (3). No CFG, so `--cfg-scale`, `--stg-scale` and TeaCache do not apply, and `--negative-prompt` is rejected.
+- **Own flags:** `--stage1-steps` (8), `--stage2-steps` (3), `--nag` with `--negative-prompt` (experimental, see [NAG](#negative-prompt-without-cfg-nag)). No CFG, so `--cfg-scale`, `--stg-scale` and TeaCache do not apply, and `--negative-prompt` alone is rejected.
 - **Example:** `ltx-2-mlx generate --distilled -p "a fox in the forest" -H 512 -W 768 -f 49 --frame-rate 24 -o fox.mp4`
 - **Notes:** fastest mode. Quality sits slightly below the dev + CFG variants.
 
@@ -73,7 +73,7 @@ Everything else is in [Common flags](#common-flags).
 - **Produces:** T2V / I2V mp4 (+ audio) — the DFR base path: half-res distilled stage with keyframe slots on a segment-aligned canvas, 2× latent upsample, then a full-res detailing stage with the official detailing IC-LoRA (`Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler`, strength 0.5) guided by the stage-1 latent. With `--video-decoder diffusion` the stage-2 keyframe slots are decoded as a keyframe-aware second stream (`--video-decoder conv`, the default, ignores them with a warning). `--temporal-upscalings T` adds T temporal x2 refine rounds on top: `(N-1)*2**T+1` frames at `frame_rate*2**T` fps, audio carried over unchanged from stage 1 (frozen, not re-denoised). `--spatial-upscalings 2` runs stage 1 at H/4 and stage 2 + the temporal rounds at H/2 (dims floored to multiples of 128 px, with a warning), then adds a full-res spatial epilogue: the carry keyframes are decoded one plane at a time, Lanczos-upsampled x2 and re-encoded as strength-1.0 keyframes, and the H/2 latent is spatially upsampled and re-denoised window by window (one window per last-round temporal tile, each pinned to the previous one; detailing LoRA, the H/2 latent as an IC-LoRA reference, frozen stage-1 audio, an opening frame anchoring frame 0 when no image does): one ancestral step on a 2×2 spatial tile grid, then the remaining steps on 4×4.
 - **Packs:** 2.5 only. **Tier:** Experimental.
 - **Required:** `--prompt`, `--output`, `--frame-rate` (`-f` optional: auto-predicted).
-- **Own flags:** `--detailing-lora PATH_OR_REPO` (official LoRA, downloaded on first use — **gated repo**: accept the licence once at [huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler](https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler) with the account `huggingface-cli login` uses, or the run stops before any model load; a local `.safetensors` path skips the download), `--stage1-steps` (8), `--stage2-steps` (3), `--image PATH FRAME STRENGTH` (repeatable), `--spatial-upscalings {1,2}` (1), `--temporal-upscalings {0,1,2}` (0), `--temporal-upsampler-path PATH` (default: the pack's `temporal_upscaler_x2_v1_0.safetensors`). Not accepted: `--num-generated-keyframes` (slots come from the canvas), `--enable-teacache`, `--cfg-scale`, `--stg-scale`, `--negative-prompt`; with `--temporal-upscalings` set or `--spatial-upscalings 2`, also not accepted: `--segment` (Prompt Relay), `--tile-frames` / `--tile-spatial`.
+- **Own flags:** `--detailing-lora PATH_OR_REPO` (official LoRA, downloaded on first use — **gated repo**: accept the licence once at [huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler](https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler) with the account `huggingface-cli login` uses, or the run stops before any model load; a local `.safetensors` path skips the download), `--stage1-steps` (8), `--stage2-steps` (3), `--image PATH FRAME STRENGTH` (repeatable), `--spatial-upscalings {1,2}` (1), `--temporal-upscalings {0,1,2}` (0), `--temporal-upsampler-path PATH` (default: the pack's `temporal_upscaler_x2_v1_0.safetensors`). `--nag` with `--negative-prompt` (experimental, see [NAG](#negative-prompt-without-cfg-nag); every pass, temporal rounds and epilogue included). Not accepted: `--num-generated-keyframes` (slots come from the canvas), `--enable-teacache`, `--cfg-scale`, `--stg-scale`, `--negative-prompt` without `--nag`; with `--temporal-upscalings` set or `--spatial-upscalings 2`, also not accepted: `--segment` (Prompt Relay), `--tile-frames` / `--tile-spatial`.
 - **Example:** `ltx-2-mlx generate --dfr --model /path/to/ltx-2.5-mlx-q8 -p "a fox in the forest" -H 512 -W 768 -f 49 --frame-rate 24 --low-ram -o fox.mp4`
 - **Cost (M2 Pro 32 GB, q8, `--low-ram`):** 768 × 512, 49 frames ≈ 277 s (8-step stage 1 at ~10.7 s/forward over 864 video tokens, 3-step stage 2 at ~53.5 s/forward over 4128 tokens — target + 2 keyframe slots + the half-res reference), peak Metal 14.0 GB, max RSS 10.8 GB. Frame 24 is visibly sharper (tree crowns, haze texture) than the plain `--distilled` render at the same seed. `--image` (I2V, frame 0 anchor) adds ~7 s. A 137-frame request pads to a 145-frame canvas (6 slots) and costs ≈ 783 s. `--video-decoder diffusion` at 1152 × 768, 25 frames runs untiled at ≈ 465 s, 12 GB peak Metal (the decoder now runs in its own bf16 whatever dtype the pipeline hands it; the first measurement, 22 GB, was the decode promoted to fp32 by an fp32 stage-2 latent). The keyframe-aware diffusion decode costs +58 % on the decode phase at 768 × 512 × 49 (157 s vs 100 s, 2 planes), same peak Metal. Temporal rounds at 768 × 512, 121 frames, `--no-audio`: `--temporal-upscalings 1` (241 frames @ 48 fps) ≈ 27 min (1599 s), `--temporal-upscalings 2` (481 @ 96) ≈ 67 min (4028 s). Spatial epilogue at 1536 × 1024, 49 frames, `--no-audio`: `--spatial-upscalings 2` ≈ 38 min (2272 s; epilogue 1941 s: one step on 2×2 tiles, then 4×4), peak Metal 11.2 GB; + `--temporal-upscalings 1` (97 frames @ 48 fps) ≈ 84 min (5015 s; epilogue 4251 s), peak Metal 16.8 GB.
 - **Notes:** on I2V, the first-frame keyframe marker is now applied consistently (see [Details](../CLAUDE.md#dfr-base-path-generate---dfr-25-packs-experimental)). `--segment` (Prompt Relay) auto-distributes over the padded canvas, not the requested duration (e.g. 145 frames for `-f 137`), so segment boundaries shift by the padding before the tail is trimmed — pass explicit segment lengths for exact boundaries. [Details](../CLAUDE.md#dfr-base-path-generate---dfr-25-packs-experimental).
@@ -221,10 +221,29 @@ Run `ltx-2-mlx <subcommand> --help` for the exact spelling of these options.
 | `--diffvae-tile FRAMES HEIGHT WIDTH` | auto | Diffusion-decoder tile size, in pixel frames and pixels (multiples of 2 and 8; `0` leaves an axis untiled, `0 0 0` forces a single tile). | with `--video-decoder diffusion` |
 | `--lora PATH STRENGTH` | — | Extra LoRA weights, repeatable. A local `.safetensors` file or a HuggingFace repo id. Required on the IC-LoRA family. | `generate` modes, `ic-lora`, `lipdub` |
 | `--enhance-prompt` | off | Rewrite the prompt with Gemma before generating. Gemma 3 only, so it raises on 2.5 packs. | `generate` modes |
-| `--negative-prompt` | upstream `DEFAULT_NEGATIVE_PROMPT` | Negative prompt for CFG: what the video should avoid. One global prompt, even with `--segment`. `""` is encoded as an empty prompt, not replaced by the default. Rejected by `--distilled`, `--dfr` and `retake --distilled` (no CFG). | CFG modes: `generate --one-stage` / `--two-stage` / `--two-stages-hq`, `keyframe`, `a2v`, `retake`, `extend` |
+| `--negative-prompt` | upstream `DEFAULT_NEGATIVE_PROMPT` | Negative prompt for CFG: what the video should avoid. One global prompt, even with `--segment`. `""` is encoded as an empty prompt, not replaced by the default. Rejected by `--distilled`, `--dfr` and `retake --distilled` (no CFG) unless `--nag` is set on `--distilled` / `--dfr`; there it has no default. | CFG modes: `generate --one-stage` / `--two-stage` / `--two-stages-hq`, `keyframe`, `a2v`, `retake`, `extend`; `--distilled` / `--dfr` with `--nag` |
 | `--dev-transformer` | `transformer-dev.safetensors` on `generate`, unset elsewhere | Filename of the dev (non-distilled) transformer inside the pack. On `keyframe` and `ic-lora` there is no default, and on `ic-lora` passing it switches dev mode on. | `generate` modes, `keyframe`, `ic-lora` |
 | `--distilled-lora` | resolved from the pack; `ltx-2.3-22b-distilled-lora-384-1.1.safetensors` on `ic-lora` | Filename of the distilled LoRA used by the refine stage. | `generate` modes, `keyframe`, `ic-lora` |
 | `--distilled-lora-strength` | 1.0 (0.5 on `ic-lora` dev mode) | Strength of that LoRA. Any value other than 1.0 forces bind-time fusion under `--low-ram`. | `generate` modes, `ic-lora` |
+
+### Negative prompt without CFG (NAG)
+
+Experimental. Normalized Attention Guidance applies `--negative-prompt` on the distilled paths, which have no
+unconditional pass: inside every text cross-attention (video `attn2`, audio `audio_attn2`) the queries also attend to the
+negative prompt, and the two outputs are extrapolated, L1-norm clipped and blended. One extra attention per
+cross-attention call instead of a second model pass. The settings and their defaults are those of kijai's `LTX2_NAG`
+ComfyUI node. Measured on the 2.5 q8 pack (M4 Pro, `--distilled` 768×512×97): +14 % per stage-1 step and +7 % per
+stage-2 step, peak memory unchanged; a negative naming a wide-open mouth made the mouth open less in 4 of 4 runs with the
+speech unchanged, while a negative naming distorted hands did not fix motion-blurred fingers.
+[Details](../CLAUDE.md#negative-prompt-without-cfg-nag---nag).
+
+| Flag | Default | Effect | Applies to |
+|---|---|---|---|
+| `--nag` | off | Turn NAG on. Needs `--negative-prompt`. | `generate --distilled`, `generate --dfr` |
+| `--nag-scale` | 11.0 | Extrapolation away from the negative prompt, `>= 1` (`1` = no effect). | with `--nag` |
+| `--nag-alpha` | 0.25 | Blend of the guided output with the plain one, in [0, 1]. | with `--nag` |
+| `--nag-tau` | 2.5 | Clip on how far the guided output's L1 norm may grow over the plain one's, per token. | with `--nag` |
+| `--nag-video-only` | off | Leave the audio cross-attention unguided. | with `--nag` |
 
 ### Memory
 
@@ -293,7 +312,12 @@ are utilities and have no column.
 | `--diffvae-tile` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `--lora` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `--enhance-prompt` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `--negative-prompt` | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ |
+| `--negative-prompt` | with `--nag` | ✅ | ✅ | ✅ | with `--nag` | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ |
+| `--nag` | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `--nag-scale` | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `--nag-alpha` | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `--nag-tau` | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `--nag-video-only` | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `--dev-transformer` | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `--distilled-lora` | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `--distilled-lora-strength` | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
@@ -326,7 +350,7 @@ are utilities and have no column.
 
 A ❌ means the flag is either rejected by the parser or accepted and inert for that
 mode. The five `generate` modes share one parser: a ❌ flag on one of them is either
-rejected up front with an explicit error (CFG, TeaCache and DFR-only flags) or accepted
+rejected up front with an explicit error (CFG, NAG, TeaCache and DFR-only flags) or accepted
 and ignored.
 
 `a2v --distilled` takes the `a2v` column except the CFG and TeaCache flags: `--cfg-scale`,
