@@ -44,6 +44,29 @@ def carry_latent_frames(carry_pixel_frames: int = EXTEND_CARRY_PIXEL_FRAMES) -> 
     return (carry_pixel_frames - 1) // 8 + 1
 
 
+def fit_audio_latent(audio_latent: mx.array, audio_tokens: int) -> mx.array:
+    """Right-pad (zeros) or trim an audio latent ``(1, 8, T, 16)`` to exactly ``audio_tokens`` tokens.
+
+    The source's audio stream can end before its video (trimmed or edited clips), so the encoded track can be shorter
+    than the clip. The carry takes its last tokens and the window's audio is appended after the whole source audio,
+    so both need the audio to span the same length as the video.
+
+    Args:
+        audio_latent: Encoded source audio.
+        audio_tokens: The clip's audio token count (``compute_audio_token_count``).
+
+    Returns:
+        The latent with ``audio_tokens`` tokens on the time axis.
+    """
+    have = audio_latent.shape[2]
+    if have > audio_tokens:
+        return audio_latent[:, :, :audio_tokens, :]
+    if have < audio_tokens:
+        pad = mx.zeros((*audio_latent.shape[:2], audio_tokens - have, audio_latent.shape[3]), dtype=audio_latent.dtype)
+        return mx.concatenate([audio_latent, pad], axis=2)
+    return audio_latent
+
+
 def carry_audio_tokens(frame_rate: float, carry_pixel_frames: int = EXTEND_CARRY_PIXEL_FRAMES) -> int:
     """Audio latent tokens that cover the carried video (upstream ``AudioLatentShape.from_duration``, at least 1)."""
     return max(1, compute_audio_token_count(carry_pixel_frames, frame_rate=frame_rate))
@@ -203,6 +226,7 @@ class ExtendDistilledPipeline(DistilledPipeline):
         if self.low_memory:
             aggressive_cleanup()
 
+        audio_latent = fit_audio_latent(audio_latent, compute_audio_token_count(num_frames, frame_rate=frame_rate))
         audio_tokens, _ = self.audio_patchifier.patchify(audio_latent)
         self._carry = _Carry(
             video_half=self.video_patchifier.patchify(half_latent[:, :, -carry:])[0],
@@ -248,4 +272,10 @@ class ExtendDistilledPipeline(DistilledPipeline):
         return video, audio
 
 
-__all__ = ["EXTEND_CARRY_PIXEL_FRAMES", "ExtendDistilledPipeline", "carry_audio_tokens", "carry_latent_frames"]
+__all__ = [
+    "EXTEND_CARRY_PIXEL_FRAMES",
+    "ExtendDistilledPipeline",
+    "carry_audio_tokens",
+    "carry_latent_frames",
+    "fit_audio_latent",
+]

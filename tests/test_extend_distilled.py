@@ -24,6 +24,7 @@ from ltx_pipelines_mlx.extend_distilled import (
     _Carry,
     carry_audio_tokens,
     carry_latent_frames,
+    fit_audio_latent,
 )
 from ltx_pipelines_mlx.utils.helpers import create_noised_state
 
@@ -501,3 +502,37 @@ def test_cli_dev_extend_rejects_image_anchors(monkeypatch, tmp_path):
     monkeypatch.setattr(retake_mod, "RetakePipeline", must_not_build)
     with pytest.raises(SystemExit, match="--image needs --distilled"):
         cli._cmd_extend(_extend_args(tmp_path, "--image", "face.png", "last", "0.7"))
+
+
+# --- source audio that does not span the video -------------------------------------------------------------
+
+
+def _ramp(tokens: int) -> mx.array:
+    return mx.broadcast_to(mx.arange(1, tokens + 1).reshape(1, 1, tokens, 1).astype(mx.bfloat16), (1, 8, tokens, 16))
+
+
+def test_fit_audio_latent_pads_trims_and_keeps_exact():
+    audio = _ramp(40)
+    padded = fit_audio_latent(audio, 51)
+    assert padded.shape == (1, 8, 51, 16) and padded.dtype == audio.dtype
+    assert mx.array_equal(padded[:, :, :40], audio).item() and mx.all(padded[:, :, 40:] == 0).item()
+    assert mx.array_equal(fit_audio_latent(_ramp(60), 51), _ramp(51)).item()
+    assert fit_audio_latent(audio, 40) is audio
+
+
+@pytest.mark.parametrize("have", [40, 10, 60])
+def test_a_source_audio_that_does_not_span_the_video_is_fitted_before_the_carry_and_the_append(
+    stubbed, monkeypatch, have
+):
+    pipe, record, _ = stubbed
+    monkeypatch.setattr(ext_mod, "encode_source_audio_latent", lambda *a, **k: _ramp(have))
+    expected = fit_audio_latent(_ramp(have), 51)
+
+    _, audio = pipe.extend_from_video("she smiles", "src.mp4", extend_frames=3, seed=7, stage1_steps=4)
+
+    # The carry is the last 26 tokens of the video-length track, not of the (shorter or longer) encoded one.
+    assert mx.array_equal(record["carry_during_stage1"].audio[0, :, 0], expected[0, 0, -26:, 0]).item()
+    # The appended window audio starts right after the video-length source audio.
+    assert audio.shape == (1, 8, 51 + 51 - 26, 16)
+    assert mx.array_equal(audio[:, :, :51], expected).item()
+    assert mx.all(audio[:, :, 51:] == -1).item()
