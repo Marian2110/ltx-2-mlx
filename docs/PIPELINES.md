@@ -244,7 +244,7 @@ would otherwise not fit. On a 32 GB Mac at typical token counts, prefer `--low-r
 | `--stepwise-interval N` | 1 | Preview every N denoising steps. The final step is always previewed. | with `--stepwise-image-output-dir` |
 | `--stepwise-frames N` | 8 | Latent frames per preview. The VAE upsamples time 8×, so N latent frames give 8N−7 pixel frames, about 2.3 s at the default. Cost is independent of clip length. `1` gives a single still. | with `--stepwise-image-output-dir` |
 | `--stepwise-frame I` | middle | Latent frame the preview window is centred on. Negative values count from the end. The middle is the default because frame 0 is the clean conditioning image on I2V runs. | with `--stepwise-image-output-dir` |
-| `--segment "TEXT" [LEN]` | — | Prompt Relay: a local prompt gated to a slice of the timeline, repeatable in timeline order. The global `--prompt` still applies everywhere. Not compatible with modality tiling. [Details](../CLAUDE.md#prompt-relay---segment). | `generate` modes |
+| `--segment "TEXT" [LEN]` | — | Prompt Relay: a local prompt gated to a slice of the timeline, repeatable in timeline order. `LEN` is in latent frames. The global `--prompt` still applies everywhere. Validated on 2.3 and 2.5 packs. Not compatible with modality tiling. [Details](../CLAUDE.md#prompt-relay---segment). | `generate` modes |
 | `--relay-epsilon` | 1e-3 | Prompt Relay falloff. Smaller is sharper temporal gating. | with `--segment` |
 | `--relay-strength` | 1.0 | Prompt Relay penalty multiplier. Higher isolates segments more strictly. | with `--segment` |
 
