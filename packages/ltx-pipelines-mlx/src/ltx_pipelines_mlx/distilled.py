@@ -33,6 +33,7 @@ from ltx_core_mlx.components.patchifiers import (
     snap_output_dimensions,
 )
 from ltx_core_mlx.conditioning.types.keyframe_slots import extract_generated_keyframes
+from ltx_core_mlx.conditioning.types.latent_cond import LatentState
 from ltx_core_mlx.model.transformer.model import X0Model
 from ltx_core_mlx.model.transformer.sparse_attention import SparseAttentionState
 from ltx_core_mlx.model.upsampler import LatentUpsampler
@@ -291,6 +292,52 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
         if self.verbose:
             print(f"[sparse-attention] {state.calls} attention calls ran sparse", file=sys.stderr, flush=True)
 
+    def _stage1_audio_state(
+        self,
+        audio_shape: tuple[int, int, int],
+        audio_positions: mx.array,
+        spatial_dims: tuple[int, int, int],
+        seed: int,
+    ) -> LatentState:
+        """Stage 1's audio state: pure noise, generated jointly with the video.
+
+        :class:`~ltx_pipelines_mlx.a2vid_distilled.A2VidDistilledPipeline` overrides it to freeze an
+        input track instead.
+        """
+        return create_noised_state(
+            base_shape=audio_shape,
+            conditionings=[],
+            spatial_dims=spatial_dims,  # unused
+            positions=audio_positions,
+            seed=seed,
+            sigma=1.0,
+            initial_latent=None,
+            legacy_scalar_blend=True,
+        )
+
+    def _stage2_audio_state(
+        self,
+        audio_tokens: mx.array,
+        audio_positions: mx.array,
+        spatial_dims: tuple[int, int, int],
+        seed: int,
+        sigma: float,
+    ) -> LatentState:
+        """Stage 2's audio state: stage 1's audio re-noised at ``sigma`` and refined with the video.
+
+        :class:`~ltx_pipelines_mlx.a2vid_distilled.A2VidDistilledPipeline` overrides it to keep the
+        input track frozen.
+        """
+        return create_noised_state(
+            base_shape=audio_tokens.shape,
+            conditionings=[],
+            spatial_dims=spatial_dims,  # unused
+            positions=audio_positions,
+            seed=seed,
+            sigma=sigma,
+            initial_latent=audio_tokens,
+        )
+
     def generate_two_stage(  # type: ignore[override]
         self,
         prompt: str,
@@ -510,16 +557,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             initial_latent=None,
             legacy_scalar_blend=True,
         )
-        audio_state = create_noised_state(
-            base_shape=audio_shape,
-            conditionings=[],
-            spatial_dims=(F, H_half, W_half),  # unused
-            positions=audio_positions,
-            seed=seed + 1,
-            sigma=1.0,
-            initial_latent=None,
-            legacy_scalar_blend=True,
-        )
+        audio_state = self._stage1_audio_state(audio_shape, audio_positions, (F, H_half, W_half), seed + 1)
 
         stage1_table = LTX_2_5_DISTILLED_SIGMAS if self._is_25 else DISTILLED_SIGMAS
         sigmas_1 = shorten_schedule(stage1_table, stage1_steps, keep="start")
@@ -683,15 +721,8 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             legacy_scalar_blend=True,
         )
 
-        audio_tokens_1 = stage1.audio_tokens
-        audio_state_2 = create_noised_state(
-            base_shape=audio_tokens_1.shape,
-            conditionings=[],
-            spatial_dims=(F, H_full, W_full),  # unused
-            positions=audio_positions,
-            seed=seed + 2,
-            sigma=start_sigma,
-            initial_latent=audio_tokens_1,
+        audio_state_2 = self._stage2_audio_state(
+            stage1.audio_tokens, audio_positions, (F, H_full, W_full), seed + 2, start_sigma
         )
 
         stage2_x0_model = x0_model

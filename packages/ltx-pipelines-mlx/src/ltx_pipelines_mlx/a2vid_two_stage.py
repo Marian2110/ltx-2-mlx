@@ -32,11 +32,136 @@ from ltx_core_mlx.model.transformer.model import X0Model
 from ltx_core_mlx.utils.audio import load_audio
 from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_token_count, compute_video_positions
+from ltx_pipelines_mlx._base import BasePipeline
 from ltx_pipelines_mlx.scheduler import STAGE_2_SIGMAS, ltx2_schedule, shorten_schedule
 from ltx_pipelines_mlx.ti2vid_two_stages import DEFAULT_CFG_SCALE, TI2VidTwoStagesPipeline
 from ltx_pipelines_mlx.utils.blocks import snap_num_frames
 from ltx_pipelines_mlx.utils.helpers import create_noised_state
 from ltx_pipelines_mlx.utils.samplers import OnStepFn, denoise_loop, guided_denoise_loop
+
+
+def encode_source_audio(
+    pipe: BasePipeline,
+    audio_path: str | Path,
+    *,
+    num_frames: int,
+    frame_rate: float,
+    start_time: float,
+    max_duration: float,
+) -> mx.array:
+    """Encode the input audio into the tokens that condition the clip.
+
+    Loads the audio VAE encoder, and frees it again under ``low_memory``.
+
+    Args:
+        pipe: Pipeline whose audio encoder, processor and patchifier are used.
+        audio_path: Input audio file.
+        num_frames: Clip length in pixel frames (already snapped to the causal grid).
+        frame_rate: Clip frame rate.
+        start_time: Where to start reading the audio, in seconds.
+        max_duration: How much audio to read, in seconds.
+
+    Returns:
+        ``(1, audio_T, 128)`` audio tokens covering the clip.
+
+    Raises:
+        ValueError: when the file has no audio or the audio is shorter than the clip.
+    """
+    pipe._load_audio_encoder()
+    assert pipe.audio_encoder is not None
+    assert pipe.audio_processor is not None
+
+    audio_data = load_audio(
+        audio_path,
+        target_sample_rate=16000,
+        start_time=start_time,
+        max_duration=max_duration,
+    )
+    if audio_data is None:
+        raise ValueError(f"No audio found in {audio_path}")
+
+    audio_latent = encode_audio(
+        audio_data.waveform,
+        audio_data.sample_rate,
+        pipe.audio_encoder,
+        pipe.audio_processor,
+    )
+
+    # Patchify audio to tokens
+    audio_T = compute_audio_token_count(num_frames, frame_rate)
+    # Upstream asserts the sliced latent matches the target shape in
+    # ``create_initial_state``; without this check a short clip leaves
+    # fewer tokens than positions and fails deep in RoPE.
+    if audio_latent.shape[2] < audio_T:
+        raise ValueError(
+            f"Audio is too short for the requested clip: {audio_latent.shape[2]} audio latent frames "
+            f"available, {audio_T} needed for {num_frames} frames at {frame_rate} fps "
+            f"({num_frames / frame_rate:.2f} s). Use a longer audio segment, fewer frames, "
+            "or pad the audio with silence."
+        )
+    audio_latent = audio_latent[:, :, :audio_T, :]
+    audio_tokens, _ = pipe.audio_patchifier.patchify(audio_latent)  # (1, audio_T, 128)
+    mx.synchronize()
+
+    # Free audio encoder via composition block
+    if pipe.low_memory:
+        pipe.audio_conditioner.free()
+    return audio_tokens
+
+
+def decode_with_source_audio(
+    pipe: BasePipeline,
+    video_latent: mx.array,
+    output_path: str,
+    *,
+    audio_path: str | Path,
+    start_time: float,
+    num_frames: int,
+    frame_rate: float,
+) -> None:
+    """Decode the video and mux the input audio into it, not a VAE-decoded track.
+
+    The original waveform is higher fidelity than the audio VAE's reconstruction;
+    it is trimmed to the exact video duration to keep it in sync.
+
+    Args:
+        pipe: Pipeline whose video decoder block is loaded.
+        video_latent: Full-resolution video latent, ``(1, 128, F, H, W)``.
+        output_path: Output video path.
+        audio_path: Input audio file.
+        start_time: Where the clip's audio starts in the file, in seconds.
+        num_frames: Clip length in pixel frames.
+        frame_rate: Clip frame rate.
+    """
+    import tempfile
+
+    video_duration = num_frames / frame_rate
+    audio_data_48k = load_audio(
+        audio_path,
+        target_sample_rate=48000,
+        start_time=start_time,
+        max_duration=video_duration,
+    )
+    if audio_data_48k is not None:
+        # Trim to exact sample count for video duration
+        max_samples = int(video_duration * 48000)
+        waveform_48k = audio_data_48k.waveform[:, :, :max_samples]
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as _tmp:
+            temp_audio = _tmp.name
+        pipe._save_waveform(waveform_48k, temp_audio, sample_rate=48000)
+    else:
+        temp_audio = None
+
+    try:
+        pipe.video_decoder_block.decode_and_stream(
+            video_latent,
+            output_path,
+            frame_rate=frame_rate,
+            audio_path=temp_audio,
+        )
+    finally:
+        if temp_audio is not None:
+            Path(temp_audio).unlink(missing_ok=True)
 
 
 class A2VidPipelineTwoStage(TI2VidTwoStagesPipeline):
@@ -167,45 +292,15 @@ class A2VidPipelineTwoStage(TI2VidTwoStagesPipeline):
             audio_max_duration = num_frames / frame_rate
 
         # --- Encode audio ---
-        self._load_audio_encoder()
-        assert self.audio_encoder is not None
-        assert self.audio_processor is not None
-
-        audio_data = load_audio(
+        audio_tokens = encode_source_audio(
+            self,
             audio_path,
-            target_sample_rate=16000,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
             start_time=audio_start_time,
             max_duration=audio_max_duration,
         )
-        if audio_data is None:
-            raise ValueError(f"No audio found in {audio_path}")
-
-        audio_latent = encode_audio(
-            audio_data.waveform,
-            audio_data.sample_rate,
-            self.audio_encoder,
-            self.audio_processor,
-        )
-
-        # Patchify audio to tokens
-        audio_T = compute_audio_token_count(num_frames, frame_rate)
-        # Upstream asserts the sliced latent matches the target shape in
-        # ``create_initial_state``; without this check a short clip leaves
-        # fewer tokens than positions and fails deep in RoPE.
-        if audio_latent.shape[2] < audio_T:
-            raise ValueError(
-                f"Audio is too short for the requested clip: {audio_latent.shape[2]} audio latent frames "
-                f"available, {audio_T} needed for {num_frames} frames at {frame_rate} fps "
-                f"({num_frames / frame_rate:.2f} s). Use a longer audio segment, fewer frames, "
-                "or pad the audio with silence."
-            )
-        audio_latent = audio_latent[:, :, :audio_T, :]
-        audio_tokens, _ = self.audio_patchifier.patchify(audio_latent)  # (1, audio_T, 128)
-        mx.synchronize()
-
-        # Free audio encoder via composition block
-        if self.low_memory:
-            self.audio_conditioner.free()
+        audio_T = audio_tokens.shape[1]
 
         # --- Text encoding (positive + negative for CFG) ---
         video_embeds, audio_embeds, neg_video_embeds, neg_audio_embeds = self._encode_text_with_negative(
@@ -404,36 +499,15 @@ class A2VidPipelineTwoStage(TI2VidTwoStagesPipeline):
 
         self._load_decoders()
 
-        # Use original audio for output (higher fidelity than VAE-decoded)
-        # Trim to exact video duration to ensure sync
-        import tempfile
-
-        video_duration = num_frames / frame_rate
-        audio_data_48k = load_audio(
-            audio_path,
-            target_sample_rate=48000,
-            start_time=audio_start_time,
-            max_duration=video_duration,
-        )
-        if audio_data_48k is not None:
-            # Trim to exact sample count for video duration
-            max_samples = int(video_duration * 48000)
-            waveform_48k = audio_data_48k.waveform[:, :, :max_samples]
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as _tmp:
-                temp_audio = _tmp.name
-            self._save_waveform(waveform_48k, temp_audio, sample_rate=48000)
-        else:
-            temp_audio = None
-
-        self.video_decoder_block.decode_and_stream(
+        decode_with_source_audio(
+            self,
             video_latent,
             output_path,
+            audio_path=audio_path,
+            start_time=audio_start_time,
+            num_frames=num_frames,
             frame_rate=frame_rate,
-            audio_path=temp_audio,
         )
-
-        if temp_audio is not None:
-            Path(temp_audio).unlink(missing_ok=True)
         aggressive_cleanup()
 
         return output_path

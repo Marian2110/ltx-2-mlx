@@ -125,6 +125,7 @@ packages/
 │       ├── dfr.py                         # DFRPipeline (generate --dfr, 2.5)
 │       ├── dfr_layout.py                  # DFR canvas + temporal tile plan
 │       ├── a2vid_two_stage.py             # Audio-to-video two-stage pipeline
+│       ├── a2vid_distilled.py             # Audio-to-video on the distilled path (a2v --distilled)
 │       ├── retake.py                      # RetakePipeline: regenerate a time segment + extend (append/prepend)
 │       ├── keyframe_interpolation.py      # Keyframe interpolation
 │       ├── ic_lora.py                     # IC-LoRA reference-based generation
@@ -428,7 +429,7 @@ Entry point: `uv run ltx-2-mlx <command>`. Available commands:
 | `keyframe` | Keyframe interpolation | Stable | Two-stage interpolation between start/end frames |
 | `ic-lora` | IC-LoRA | Stable | Two-stage generation with control video conditioning (depth, canny, pose, motion tracks) |
 | `hdr-ic-lora` | HDR IC-LoRA | Experimental | Single-stage ACEScct SDR-to-HDR IC-LoRA (LTX-2.5 packs only): HLG BT.2020 10-bit mp4 + ACEScg EXR frames. Takes `--input`, `--hdr-lora`, `--text-embeddings` (no prompt) |
-| `a2v` | Audio-to-video | Beta | Two-stage audio-conditioned generation (Euler + CFG). Sync quality depends on prompt-audio alignment. |
+| `a2v` | Audio-to-video | Beta | Two-stage audio-conditioned generation (Euler + CFG). Sync quality depends on prompt-audio alignment. `--distilled` (Experimental): the distilled path, no CFG, input audio frozen in both stages |
 | `retake` | Retake | Beta | Regenerate a time segment of an existing video (dev model + CFG) |
 | `extend` | Extend | Beta | Add frames before or after an existing video (dev model + CFG) |
 | `lipdub` | LipDub | Experimental | Lip-dub a reference video → re-sync visuals to source audio. Output audio is a VAE+vocoder reconstruction (audible artifacts on rich music). Uses pre-1.0 LipDub IC-LoRA. Stage 2 uses stage 1's generated audio as its reference (upstream Dub-It); the stage-1 reference is the source audio sliced or zero-padded to the clip window (#174). |
@@ -438,7 +439,7 @@ Entry point: `uv run ltx-2-mlx <command>`. Available commands:
 | `preprocess` | Data preprocessing | Stable | Encode raw videos into latents + conditions for training |
 | `slice` | Training data | Stable | Slice long videos into normalized training clips (audio retained) |
 
-`generate --one-stage/--two-stage/--two-stages-hq`, `keyframe`, `a2v`, `retake` and `extend` use the dev model with CFG; `generate --distilled/--dfr`, `ic-lora` (unless `--dev-transformer`), `hdr-ic-lora` and `lipdub` use the distilled model without CFG. Common flags: `--model`, `--prompt`, `--output`, `--seed`, `--quiet` (`hdr-ic-lora` has its own set: no `--prompt`). CFG modes (`generate --one-stage/--two-stage/--two-stages-hq`, `keyframe`, `a2v`, `retake`, `extend`) take `--negative-prompt TEXT` (default: upstream `DEFAULT_NEGATIVE_PROMPT`; `""` is encoded verbatim; always one global prompt, even with `--segment`); `--distilled` / `--dfr` reject it (no CFG), and the distilled-sampler IC-LoRA family (`ic-lora`, `hdr-ic-lora`, `lipdub`) does not expose it. Every denoising stage prints an `[estimate]` work line (steps × passes × tokens = forwards) on stderr before step 1 and a time projection after the first computed step, refined once after the second (`utils/estimate.py`; retake/extend note that cost follows total clip length). Tier semantics + promotion criteria live in [docs/PIPELINE_MATURITY.md](docs/PIPELINE_MATURITY.md).
+`generate --one-stage/--two-stage/--two-stages-hq`, `keyframe`, `a2v`, `retake` and `extend` use the dev model with CFG; `generate --distilled/--dfr`, `a2v --distilled`, `ic-lora` (unless `--dev-transformer`), `hdr-ic-lora` and `lipdub` use the distilled model without CFG. Common flags: `--model`, `--prompt`, `--output`, `--seed`, `--quiet` (`hdr-ic-lora` has its own set: no `--prompt`). CFG modes (`generate --one-stage/--two-stage/--two-stages-hq`, `keyframe`, `a2v`, `retake`, `extend`) take `--negative-prompt TEXT` (default: upstream `DEFAULT_NEGATIVE_PROMPT`; `""` is encoded verbatim; always one global prompt, even with `--segment`); `--distilled` / `--dfr` reject it (no CFG), and the distilled-sampler IC-LoRA family (`ic-lora`, `hdr-ic-lora`, `lipdub`) does not expose it. Every denoising stage prints an `[estimate]` work line (steps × passes × tokens = forwards) on stderr before step 1 and a time projection after the first computed step, refined once after the second (`utils/estimate.py`; retake/extend note that cost follows total clip length). Tier semantics + promotion criteria live in [docs/PIPELINE_MATURITY.md](docs/PIPELINE_MATURITY.md).
 
 ### Low-RAM Example
 
@@ -651,6 +652,15 @@ ltx-2-mlx a2v \
 ```
 
 Flags: `--audio` (required), `--audio-start` (default 0 s), `--frame-rate` (required, mirrors upstream `frame_rate=`), `--image` (optional I2V), `--cfg-scale` (default 3.0), `--stg-scale` (default 1.0), `--negative-prompt`, `--stage1-steps` (default 30), `--stage2-steps` (default 3), `--enable-teacache` / `--teacache-thresh` (LTX-2.3 packs).
+
+```bash
+# Distilled A2V: no dev model, no CFG (Lightricks' LTX-2.5_A2V_Two_Stage_Distilled workflow)
+ltx-2-mlx a2v --distilled \
+  --prompt "a woman talks to the camera" \
+  --audio vocals.wav --image photo.jpg -H 1280 -W 704 -f 121 --frame-rate 24 -o output.mp4
+```
+
+`A2VidDistilledPipeline` (`a2vid_distilled.py`) is `DistilledPipeline` with two hooks swapped: `_stage1_audio_state` / `_stage2_audio_state` return the encoded input track as a frozen state (`create_noised_state(..., frozen=True)`, zero mask, per-modality sigma 0) instead of noise / the re-noised stage-1 audio, as upstream's `freeze_audio=True` does in both stages. Stage 2 re-attaches the source tokens rather than stage 1's output (identical anyway: a frozen stream comes out of both loops bit for bit). The default hook bodies are the old inline calls, so `generate --distilled` and `--dfr` are byte-identical. The audio encoding and the source-waveform mux are shared with `a2v` (`encode_source_audio` / `decode_with_source_audio` in `a2vid_two_stage.py`). Flags: the `a2v` ones minus `--cfg-scale`, `--stg-scale`, `--negative-prompt` and `--enable-teacache` (rejected up front); `--stage1-steps` defaults to 8. Validated (M1 Max, 2.5 q8, 7 Oct): `generate --distilled`, `--distilled --low-ram`, `--dfr` and `a2v` are byte-identical (sha256) to main at 512×768×49, seed 5; `a2v --distilled` takes 109 s against 631 s for `a2v` at that size (default environment), 87 s with `--low-ram` (fp16), ~400 s at 704×1280×121 and 942 s at 704×1280×241 with three image anchors (fp16).
 
 ### Retake / Extend Example
 

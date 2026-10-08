@@ -709,12 +709,27 @@ examples:
     _add_teacache_args(a2v)
     a2v.add_argument("--audio", "-a", required=True, help="Input audio file (WAV/MP3/etc.)")
     a2v.add_argument("--audio-start", type=float, default=0.0, help="Audio start time in seconds (default: 0)")
-    a2v.add_argument("--stage1-steps", type=int, default=None, help="Stage 1 steps (default: 30)")
+    a2v.add_argument(
+        "--distilled",
+        action="store_true",
+        help=(
+            "[experimental] Distilled two-stage A2V: the distilled model at half resolution, upscale, distilled "
+            "refine, no CFG, the input audio frozen in both stages. Mirrors Lightricks' "
+            "LTX-2.5_A2V_Two_Stage_Distilled ComfyUI workflow and costs a generate --distilled render. "
+            "With music or loud ambience, pass the isolated vocals."
+        ),
+    )
+    a2v.add_argument("--stage1-steps", type=int, default=None, help="Stage 1 steps (default: 30; with --distilled: 8)")
     a2v.add_argument("--stage2-steps", type=int, default=None, help="Stage 2 steps (default: 3)")
-    a2v.add_argument("--cfg-scale", type=float, default=None, help="CFG guidance scale (default: 3.0)")
+    a2v.add_argument(
+        "--cfg-scale", type=float, default=None, help="CFG guidance scale (default: 3.0; rejected by --distilled)"
+    )
     _add_negative_prompt_arg(a2v)
     a2v.add_argument(
-        "--stg-scale", type=float, default=None, help="STG guidance scale (default: 1.0 — upstream LTX_2_3_PARAMS)"
+        "--stg-scale",
+        type=float,
+        default=None,
+        help="STG guidance scale (default: 1.0 — upstream LTX_2_3_PARAMS; rejected by --distilled)",
     )
     a2v.add_argument(
         "--image",
@@ -1462,10 +1477,23 @@ def _cmd_a2v(args: argparse.Namespace) -> None:
     """Generate video from audio + text prompt."""
     t0 = time.time()
 
-    from ltx_pipelines_mlx.a2vid_two_stage import A2VidPipelineTwoStage as PipeClass
+    if args.distilled:
+        if args.cfg_scale is not None or args.stg_scale is not None:
+            raise SystemExit("a2v --distilled runs the distilled flow (no CFG / STG); drop --cfg-scale / --stg-scale.")
+        if args.negative_prompt is not None:
+            raise SystemExit("a2v --distilled runs the distilled flow (no CFG); drop --negative-prompt.")
+        if args.enable_teacache:
+            raise SystemExit("a2v --distilled runs the distilled flow; TeaCache does not apply.")
+        from ltx_pipelines_mlx.a2vid_distilled import A2VidDistilledPipeline as PipeClass
+
+        mode_name = "Audio-to-Video (distilled, no CFG)"
+    else:
+        from ltx_pipelines_mlx.a2vid_two_stage import A2VidPipelineTwoStage as PipeClass
+
+        mode_name = "Audio-to-Video (Euler + CFG)"
 
     if not args.quiet:
-        print("Mode: Audio-to-Video (Euler + CFG)")
+        print(f"Mode: {mode_name}")
         print(f"Audio: {args.audio}")
         print(f"  Model: {args.model}")
 
