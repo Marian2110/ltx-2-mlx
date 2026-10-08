@@ -1,7 +1,12 @@
 """Retake / Extend pipeline — edit an existing video.
 
-Matches the reference architecture: single-stage with dev model + CFG
-guidance. Default: 30 steps, cfg=3.0, full multi-modal guidance.
+Matches the reference architecture: single stage at the source resolution.
+Default: dev model + CFG guidance, 30 steps, cfg=3.0, full multi-modal
+guidance. ``RetakePipeline(distilled=True)`` (``retake --distilled``) runs
+upstream's default mode instead: the distilled transformer on the fixed
+8-step distilled sigma table, one forward per step, no negative prompt
+(upstream ``RetakePipeline(distilled=True)``: ``DISTILLED_SIGMAS`` +
+``SimpleDenoiser``, deterministic Euler).
 
 The class hosts both:
 
@@ -15,7 +20,8 @@ The class hosts both:
 Both modes share the same dev transformer, text encoding (positive +
 negative for CFG), and ``guided_denoise_loop`` invocation — they only
 differ in how the ``denoise_mask`` is constructed and whether new
-tokens are appended to the source latent.
+tokens are appended to the source latent. The distilled mode is wired
+into ``retake`` only; ``extend`` refuses it.
 
 Ported from ltx-pipelines/src/ltx_pipelines/retake.py
 """
@@ -39,15 +45,19 @@ from ltx_core_mlx.conditioning.types.latent_cond import (
     noise_latent_state,
 )
 from ltx_core_mlx.model.audio_vae import encode_audio
-from ltx_core_mlx.model.transformer.model import X0Model
+from ltx_core_mlx.model.transformer.model import LTXModel, X0Model
+from ltx_core_mlx.model.video_vae.tiling import TilingConfig, prepare_tiles_for_encoding
 from ltx_core_mlx.utils.audio import load_audio
 from ltx_core_mlx.utils.ffmpeg import probe_video_info
 from ltx_core_mlx.utils.image import load_video_frames
 from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_token_count, compute_video_positions
-from ltx_pipelines_mlx._base import BasePipeline
-from ltx_pipelines_mlx.scheduler import ltx2_schedule
-from ltx_pipelines_mlx.utils.samplers import guided_denoise_loop
+from ltx_pipelines_mlx._base import BasePipeline, reject_negative_prompt
+from ltx_pipelines_mlx.scheduler import DISTILLED_SIGMAS, ltx2_schedule, shorten_schedule
+from ltx_pipelines_mlx.utils.progress import phase
+from ltx_pipelines_mlx.utils.samplers import DenoiseOutput, denoise_loop, guided_denoise_loop
+
+_materialize = getattr(mx, "eval")  # noqa: B009 -- security hook flags mx.eval pattern
 
 # Reference defaults (LTX_2_3_PARAMS)
 DEFAULT_CFG_SCALE = 3.0
@@ -67,8 +77,9 @@ class _SourceMeta:
 class RetakePipeline(BasePipeline):
     """Retake pipeline: regenerate a time segment while preserving the rest.
 
-    Uses the dev (non-distilled) model with CFG guidance for quality output.
-    Single-stage pipeline (no upsampler).
+    Uses the dev (non-distilled) model with CFG guidance by default, or the
+    distilled model without guidance when ``distilled=True``. Single-stage
+    pipeline (no upsampler).
 
     Args:
         model_dir: Path to model weights.
@@ -77,6 +88,13 @@ class RetakePipeline(BasePipeline):
         low_ram_streaming: Stream transformer blocks from mmap'd safetensors
             (``--low-ram``); mirrors upstream RetakePipeline's ``offload_mode``.
         dev_transformer: Dev transformer filename.
+        distilled: Retake with the distilled transformer (``transformer.safetensors``
+            or ``transformer-distilled*.safetensors``, resolved as
+            :meth:`DistilledPipeline.load` does) on the distilled sigma table,
+            one forward per step, no negative prompt and no CFG / STG. Upstream
+            ``RetakePipeline``'s ``distilled`` flag, which defaults to ``True``
+            there; here it defaults to ``False`` so the dev path stays the
+            default. :meth:`extend` has no distilled mode yet and raises.
     """
 
     def __init__(
@@ -86,6 +104,7 @@ class RetakePipeline(BasePipeline):
         low_memory: bool = True,
         low_ram_streaming: bool = False,
         dev_transformer: str = "transformer-dev.safetensors",
+        distilled: bool = False,
     ):
         super().__init__(
             model_dir,
@@ -94,6 +113,7 @@ class RetakePipeline(BasePipeline):
             low_ram_streaming=low_ram_streaming,
         )
         self._dev_transformer = dev_transformer
+        self.distilled = distilled
         # Source frame rate, recorded by _encode_source_video so CLI-level
         # decode helpers can forward it to _decode_and_save_video without
         # re-probing the file.
@@ -118,9 +138,23 @@ class RetakePipeline(BasePipeline):
         # Encode video via ImageConditioner (loads → encodes → frees)
         video_tensor = load_video_frames(video_path, info.height, info.width, vae_compatible_frames)
 
+        # Upstream encodes the source with ``tiled_encode(frames, TileSizeConfig.default())``
+        # (768/64 px, 80/24 frames). A source that fits one tile is encoded untiled, which is
+        # the same computation, so small sources keep their exact latents; a larger one is
+        # tiled like upstream (704x1280x49: 23.7 GB Metal peak instead of 31.4 GB untiled).
+        tiling = TilingConfig.default()
+        tiled = len(prepare_tiles_for_encoding(video_tensor.shape, tiling)) > 1
+
+        # Both encodes are materialized while their encoder is loaded: ``mx.synchronize`` does not
+        # evaluate a lazy graph, so the VAE encode used to run inside the first denoising step,
+        # with the encoder weights, the source pixels and the DiT all resident at once.
         def _encode_video(encoder) -> mx.array:
-            latent = encoder.encode(video_tensor)
-            mx.synchronize()
+            if tiled:
+                # fp32 blend buffers; back to the encoder's bf16 like upstream's ``.to(dtype)``.
+                latent = encoder.tiled_encode(video_tensor, tiling).astype(mx.bfloat16)
+            else:
+                latent = encoder.encode(video_tensor)
+            _materialize(latent)
             return latent
 
         video_latent = self.image_conditioner(_encode_video, free_after=self.low_memory)
@@ -139,7 +173,9 @@ class RetakePipeline(BasePipeline):
             if audio_data is not None:
 
                 def _encode_audio(enc, proc) -> mx.array:
-                    return encode_audio(audio_data.waveform, audio_data.sample_rate, enc, proc)
+                    latent = encode_audio(audio_data.waveform, audio_data.sample_rate, enc, proc)
+                    _materialize(latent)
+                    return latent
 
                 audio_latent = self.audio_conditioner(_encode_audio, free_after=self.low_memory)
                 if self.low_memory:
@@ -183,9 +219,11 @@ class RetakePipeline(BasePipeline):
             start_frame: First latent frame to regenerate (inclusive).
             end_frame: Last latent frame to regenerate (exclusive).
             seed: Random seed.
-            num_steps: Number of denoising steps (default: 30).
-            cfg_scale: CFG guidance scale (default: 3.0).
+            num_steps: Number of denoising steps (default: 30). With ``distilled``,
+                the step count on the 8-step distilled table (see :meth:`retake`).
+            cfg_scale: CFG guidance scale (default: 3.0). Unused with ``distilled``.
             stg_scale: STG guidance scale (default: 1.0, upstream LTX_2_3_PARAMS).
+                Unused with ``distilled``.
             regenerate_audio: If True, regenerate audio in the retake region.
                 If False, preserve original audio entirely.
             negative_prompt: Negative prompt for CFG. ``None`` (default) uses
@@ -296,25 +334,41 @@ class RetakePipeline(BasePipeline):
             width: Video width.
             num_frames: Total number of pixel frames.
             seed: Random seed.
-            num_steps: Number of denoising steps (default: 30).
-            cfg_scale: CFG guidance scale (default: 3.0).
+            num_steps: Number of denoising steps (default: 30). With ``distilled``,
+                the step count on the 8-step distilled table: sigma 1.0 and then
+                the last ``num_steps`` sigmas (``shorten_schedule(..., keep="start")``,
+                as ``generate --distilled --stage1-steps``); 8 or more runs the
+                whole table.
+            cfg_scale: CFG guidance scale (default: 3.0). Unused with ``distilled``.
             stg_scale: STG guidance scale (default: 1.0, upstream LTX_2_3_PARAMS).
+                Unused with ``distilled``.
             regenerate_audio: If True, regenerate audio in the retake region.
             negative_prompt: Negative prompt for CFG. ``None`` (default) uses
                 ``DEFAULT_NEGATIVE_PROMPT``; any string (including ``""``) is
-                encoded verbatim.
+                encoded verbatim. Must stay ``None`` with ``distilled`` (no CFG).
 
         Returns:
             Tuple of (video_latent, audio_latent).
-        """
-        # --- Text encoding (positive + negative for CFG) ---
-        video_embeds, audio_embeds, neg_video_embeds, neg_audio_embeds = self._encode_text_with_negative(
-            prompt, negative_prompt
-        )
 
-        # --- Load dev transformer ---
-        if self.dit is None:
-            self.dit = self._load_dev_transformer()
+        Raises:
+            ValueError: when ``negative_prompt`` is set on a distilled pipeline.
+        """
+        if self.distilled:
+            reject_negative_prompt(negative_prompt, type(self).__name__)
+            # --- Text encoding (positive only, no CFG) + distilled transformer ---
+            video_embeds, audio_embeds = self._encode_positive_prompt(prompt)
+            neg_video_embeds = neg_audio_embeds = None
+            if self.dit is None:
+                self.dit = self._load_distilled_transformer()
+        else:
+            # --- Text encoding (positive + negative for CFG) ---
+            video_embeds, audio_embeds, neg_video_embeds, neg_audio_embeds = self._encode_text_with_negative(
+                prompt, negative_prompt
+            )
+
+            # --- Load dev transformer ---
+            if self.dit is None:
+                self.dit = self._load_dev_transformer()
         assert self.dit is not None
 
         F, H, W = compute_video_latent_shape(num_frames, height, width)
@@ -373,7 +427,67 @@ class RetakePipeline(BasePipeline):
         )
         audio_state = noise_latent_state(audio_state, sigma=1.0, seed=seed + 1)
 
-        # --- Guided denoising ---
+        if self.distilled:
+            output = self._distilled_denoise(video_state, audio_state, video_embeds, audio_embeds, (F, H, W), num_steps)
+        else:
+            output = self._guided_denoise(
+                video_state,
+                audio_state,
+                video_embeds,
+                audio_embeds,
+                neg_video_embeds,
+                neg_audio_embeds,
+                (F, H, W),
+                num_steps=num_steps,
+                cfg_scale=cfg_scale,
+                stg_scale=stg_scale,
+            )
+        if self.low_memory:
+            aggressive_cleanup()
+
+        video_latent = self.video_patchifier.unpatchify(output.video_latent, (F, H, W))
+        audio_latent = self.audio_patchifier.unpatchify(output.audio_latent)
+
+        return video_latent, audio_latent
+
+    def _encode_positive_prompt(self, prompt: str) -> tuple[mx.array, mx.array]:
+        """Load the text encoder, encode the prompt alone, materialize, free the encoder.
+
+        The positive half of :meth:`_encode_text_with_negative`, for the distilled
+        mode (upstream encodes ``[prompt]`` only when ``distilled``).
+        """
+        self._load_text_encoder()
+        with phase("Encoding prompt", verbose=self.verbose):
+            video_embeds, audio_embeds = self._encode_text(prompt)
+            _materialize(video_embeds, audio_embeds)
+        self.text_encoder = None
+        self.feature_extractor = None
+        aggressive_cleanup()
+        return video_embeds, audio_embeds
+
+    def _load_distilled_transformer(self) -> LTXModel:
+        """Load the distilled transformer, resolved as :meth:`DistilledPipeline.load` does."""
+        transformer_path = self.model_dir / "transformer.safetensors"
+        if not transformer_path.exists():
+            transformer_path = self._resolve_safetensors(self.model_dir, "transformer-distilled")
+        return self._load_transformer_with_optional_streaming(transformer_path)
+
+    def _guided_denoise(
+        self,
+        video_state: LatentState,
+        audio_state: LatentState,
+        video_embeds: mx.array,
+        audio_embeds: mx.array,
+        neg_video_embeds: mx.array,
+        neg_audio_embeds: mx.array,
+        latent_dims: tuple[int, int, int],
+        *,
+        num_steps: int,
+        cfg_scale: float,
+        stg_scale: float,
+    ) -> DenoiseOutput:
+        """Dev model + CFG / STG: the dynamic schedule and the LTX_2_3_PARAMS guiders."""
+        F, H, W = latent_dims
         num_tokens = F * H * W
         sigmas = ltx2_schedule(num_steps, num_tokens=num_tokens)
         x0_model = X0Model(self.dit)
@@ -398,7 +512,7 @@ class RetakePipeline(BasePipeline):
         audio_factory = create_multimodal_guider_factory(audio_gp, negative_context=neg_audio_embeds)
 
         self._pre_denoise_flush(video_state, audio_state)
-        output = guided_denoise_loop(
+        return guided_denoise_loop(
             model=x0_model,
             video_state=video_state,
             audio_state=audio_state,
@@ -409,13 +523,34 @@ class RetakePipeline(BasePipeline):
             sigmas=sigmas,
             on_step=self._stepwise_hook(F, H, W),
         )
-        if self.low_memory:
-            aggressive_cleanup()
 
-        video_latent = self.video_patchifier.unpatchify(output.video_latent, (F, H, W))
-        audio_latent = self.audio_patchifier.unpatchify(output.audio_latent)
+    def _distilled_denoise(
+        self,
+        video_state: LatentState,
+        audio_state: LatentState,
+        video_embeds: mx.array,
+        audio_embeds: mx.array,
+        latent_dims: tuple[int, int, int],
+        num_steps: int,
+    ) -> DenoiseOutput:
+        """Distilled model: fixed distilled sigmas, one forward per step, deterministic Euler.
 
-        return video_latent, audio_latent
+        Upstream's distilled retake (``DISTILLED_SIGMAS`` + ``SimpleDenoiser`` on the
+        default Euler loop). Unlike ``generate --distilled``, upstream does not switch
+        retake to the ancestral sampler on LTX-2.5 checkpoints, and neither does this.
+        """
+        F, H, W = latent_dims
+        sigmas = shorten_schedule(DISTILLED_SIGMAS, num_steps, keep="start")
+        self._pre_denoise_flush(video_state, audio_state)
+        return denoise_loop(
+            model=X0Model(self.dit),
+            video_state=video_state,
+            audio_state=audio_state,
+            video_text_embeds=video_embeds,
+            audio_text_embeds=audio_embeds,
+            sigmas=sigmas,
+            on_step=self._stepwise_hook(F, H, W),
+        )
 
     def extend(
         self,
@@ -461,7 +596,12 @@ class RetakePipeline(BasePipeline):
 
         Returns:
             Tuple of (extended_video_latent, extended_audio_latent).
+
+        Raises:
+            NotImplementedError: on a ``distilled`` pipeline (``extend`` runs the dev model only).
         """
+        if self.distilled:
+            raise NotImplementedError("extend has no distilled mode yet; build RetakePipeline without distilled=True.")
         video_embeds, audio_embeds, neg_video_embeds, neg_audio_embeds = self._encode_text_with_negative(
             prompt, negative_prompt
         )

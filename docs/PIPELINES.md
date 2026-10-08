@@ -16,7 +16,7 @@ Start from what you have:
 - **Two images to interpolate between** → `keyframe`.
 - **A control video** (depth / canny / pose / motion tracks) → `ic-lora`; **an SDR clip to upgrade to HDR (2.5 packs)** → `hdr-ic-lora`.
 - **An audio track to drive the video** → `a2v` (dev + CFG) · `a2v --distilled` (distilled, no CFG, experimental).
-- **An existing video to change** → `retake` (a time range) · `extend` (add frames) · `lipdub` (re-sync lips to audio, experimental).
+- **An existing video to change** → `retake` (a time range; `retake --distilled` runs the distilled model, experimental) · `extend` (add frames) · `lipdub` (re-sync lips to audio, experimental).
 - **A prompt to improve first** → the `enhance` subcommand.
 
 Then pick by constraint: 16–32 GB machines add `--low-ram`; 1080p or clips over 8 s
@@ -147,6 +147,15 @@ Everything else is in [Common flags](#common-flags).
 - **Example:** `ltx-2-mlx retake -p "a different action" -v source.mp4 --start 2 --end 5 --low-ram -o retake.mp4`
 - **Cost:** follows the **total** clip length, not the size of the regenerated window. Preserved frames are still computed and attended over on every pass.
 
+### `retake --distilled`
+
+- **Produces:** the same as `retake`, with the distilled transformer: the fixed 8-step distilled sigma table, one forward per step, no CFG. This is upstream `RetakePipeline`'s default mode (`distilled=True`: `DISTILLED_SIGMAS`, `SimpleDenoiser`, deterministic Euler).
+- **Packs:** 2.3 and 2.5 (deterministic Euler on both, as upstream's retake; the ancestral sampler of `generate --distilled` on 2.5 is not used). **Tier:** Experimental.
+- **Required:** `--prompt`, `--output`, `--video`, `--start`, `--end`.
+- **Own flags:** `--steps` (8; fewer keeps σ=1.0 and the last N sigmas of the table), `--no-regen-audio`. No CFG, so `--cfg-scale`, `--stg-scale` and `--negative-prompt` are rejected before anything loads.
+- **Example:** `ltx-2-mlx retake --distilled -p "a different action" -v source.mp4 --start 2 --end 5 -o retake.mp4`
+- **Notes:** costs 8 forwards over the whole clip instead of `retake`'s 30 steps × 4 passes. On an M1 Max (2.5 q8), a 512 × 768, 49-frame retake takes 148 s (120 s with `LTX2_COMPUTE_DTYPE=float16`) against 1793 s for `retake`; 704 × 1280 × 121 takes 695 s in float16 (716 s with `--low-ram`). Tokens outside the window stay the source's latents, as with `retake`. Like `retake`, it re-rolls a segment and is not a semantic editor: on a 49-frame clip of a woman talking, a 1 s window with "laughs and waves" kept her pose (dev and distilled alike); over latent frames 1–5, the same prompt gave a short two-hand gesture and no wave, and "covers her mouth with both hands and bursts out laughing" brought both hands up to her mouth for a few frames. `LTX2_SOL_TAU` does not apply: retake is one stage and has no stage 2.
+
 ### `extend`
 
 - **Produces:** the source video with latent frames appended before or after it. Same pipeline class as `retake`.
@@ -201,7 +210,7 @@ Run `ltx-2-mlx <subcommand> --help` for the exact spelling of these options.
 | `--diffvae-tile FRAMES HEIGHT WIDTH` | auto | Diffusion-decoder tile size, in pixel frames and pixels (multiples of 2 and 8; `0` leaves an axis untiled, `0 0 0` forces a single tile). | with `--video-decoder diffusion` |
 | `--lora PATH STRENGTH` | — | Extra LoRA weights, repeatable. A local `.safetensors` file or a HuggingFace repo id. Required on the IC-LoRA family. | `generate` modes, `ic-lora`, `lipdub` |
 | `--enhance-prompt` | off | Rewrite the prompt with Gemma before generating. Gemma 3 only, so it raises on 2.5 packs. | `generate` modes |
-| `--negative-prompt` | upstream `DEFAULT_NEGATIVE_PROMPT` | Negative prompt for CFG: what the video should avoid. One global prompt, even with `--segment`. `""` is encoded as an empty prompt, not replaced by the default. Rejected by `--distilled` and `--dfr` (no CFG). | CFG modes: `generate --one-stage` / `--two-stage` / `--two-stages-hq`, `keyframe`, `a2v`, `retake`, `extend` |
+| `--negative-prompt` | upstream `DEFAULT_NEGATIVE_PROMPT` | Negative prompt for CFG: what the video should avoid. One global prompt, even with `--segment`. `""` is encoded as an empty prompt, not replaced by the default. Rejected by `--distilled`, `--dfr` and `retake --distilled` (no CFG). | CFG modes: `generate --one-stage` / `--two-stage` / `--two-stages-hq`, `keyframe`, `a2v`, `retake`, `extend` |
 | `--dev-transformer` | `transformer-dev.safetensors` on `generate`, unset elsewhere | Filename of the dev (non-distilled) transformer inside the pack. On `keyframe` and `ic-lora` there is no default, and on `ic-lora` passing it switches dev mode on. | `generate` modes, `keyframe`, `ic-lora` |
 | `--distilled-lora` | resolved from the pack; `ltx-2.3-22b-distilled-lora-384-1.1.safetensors` on `ic-lora` | Filename of the distilled LoRA used by the refine stage. | `generate` modes, `keyframe`, `ic-lora` |
 | `--distilled-lora-strength` | 1.0 (0.5 on `ic-lora` dev mode) | Strength of that LoRA. Any value other than 1.0 forces bind-time fusion under `--low-ram`. | `generate` modes, `ic-lora` |
@@ -232,7 +241,7 @@ would otherwise not fit. On a 32 GB Mac at typical token counts, prefer `--low-r
 | `LTX2_DIT_EVAL_EVERY` | 8 | Same guard for the DiT block loop: flush every N of the 48 blocks. `0` disables it. | all pipelines |
 | `LTX2_COMPUTE_DTYPE` | unset | Dtype for the inside of the DiT's attention and feed-forward modules. Unset, the blocks run in float32 (the F32 AdaLN tables promote them). `float16` keeps the residual stream and AdaLN modulation in float32 and runs the projections and attention in float16: on an M1 Max with the 2.5 q8 pack, a 576×1024×241 `--distilled` I2V render went from 701 s to 563 s. `bfloat16` is the precision upstream PyTorch uses. Off by default; a step whose output is not finite is recomputed without it. [Details](../CLAUDE.md#dit-compute-dtype-ltx2_compute_dtype). | all pipelines |
 | `LTX2_LORA_MODE` | `fused` | `unfused` applies LoRAs at run time (`base(x) + (x @ A^T) @ B^T`) instead of fusing them into the quantized weights, where re-quantizing loses most of a small LoRA's update. Used for the IC-LoRAs of `ic-lora` / `hdr-ic-lora` / `lipdub`, the `--dfr` detailing LoRA (detached in place, no DiT reload) and `generate --lora`; the distilled LoRA is always fused, and `--low-ram` keeps fusing each block at bind. [Details](../CLAUDE.md#lora-mode-ltx2_lora_mode). | resident pipelines with LoRAs |
-| `LTX2_SOL_TAU` | unset | Block-sparse video self-attention in the distilled stage 2 (NVIDIA's Sol-Attn routing): one threshold per stage-2 step, e.g. `1.0,1.25,1.5` (NVIDIA's LTX-2.5 values; the last one repeats). Key blocks below the threshold enter the softmax as one centroid each instead of 64 exact keys; block 0 and calls with a mask stay dense. On an M1 Max with the 2.5 q8 pack (float16 compute), stage-2 steps were 21 % faster at 17,856 tokens and 36 % at 32,640, whole renders 12 % and 22 %; the gain grows with resolution and length. The output changes slightly (the skipped blocks are approximated): about 30–32 dB PSNR against the dense render on I2V clips, same speech and lip sync, identity to the start image a little lower. Unset or `off` is the dense path, unchanged. [Details](../CLAUDE.md#block-sparse-stage-2-attention-ltx2_sol_tau). | `generate --distilled`, `generate --dfr` (stage 2) |
+| `LTX2_SOL_TAU` | unset | Block-sparse video self-attention in the distilled stage 2 (NVIDIA's Sol-Attn routing): one threshold per stage-2 step, e.g. `1.0,1.25,1.5` (NVIDIA's LTX-2.5 values; the last one repeats). Key blocks below the threshold enter the softmax as one centroid each instead of 64 exact keys; block 0 and calls with a mask stay dense. On an M1 Max with the 2.5 q8 pack (float16 compute), stage-2 steps were 21 % faster at 17,856 tokens and 36 % at 32,640, whole renders 12 % and 22 %; the gain grows with resolution and length. The output changes slightly (the skipped blocks are approximated): about 30–32 dB PSNR against the dense render on I2V clips, same speech and lip sync, identity to the start image a little lower. Unset or `off` is the dense path, unchanged. [Details](../CLAUDE.md#block-sparse-stage-2-attention-ltx2_sol_tau). | `generate --distilled`, `generate --dfr` (stage 2; not `retake --distilled`, which has no stage 2) |
 | `LTX2_GEMMA_MAX_LENGTH` | 1024 | Cap on the padded Gemma sequence length. Lowering it halves the encode time but shifts the text positions away from what the model was trained with (quality risk). Last resort. | all pipelines |
 | `AGX_RELAX_CDM_CTXSTORE_TIMEOUT` | unset | An AGX driver knob, not an LTX-2 variable, and never set automatically. It relaxes the watchdog eviction timeout for the process that sets it, working around a macOS 26.x and MLX 0.31.x regression. The UI may stutter during the run, and on some machines running with the display off is the only reliable workaround. | all pipelines |
 
@@ -244,7 +253,7 @@ would otherwise not fit. On a 32 GB Mac at typical token counts, prefer `--low-r
 | `--stepwise-interval N` | 1 | Preview every N denoising steps. The final step is always previewed. | with `--stepwise-image-output-dir` |
 | `--stepwise-frames N` | 8 | Latent frames per preview. The VAE upsamples time 8×, so N latent frames give 8N−7 pixel frames, about 2.3 s at the default. Cost is independent of clip length. `1` gives a single still. | with `--stepwise-image-output-dir` |
 | `--stepwise-frame I` | middle | Latent frame the preview window is centred on. Negative values count from the end. The middle is the default because frame 0 is the clean conditioning image on I2V runs. | with `--stepwise-image-output-dir` |
-| `--segment "TEXT" [LEN]` | — | Prompt Relay: a local prompt gated to a slice of the timeline, repeatable in timeline order. The global `--prompt` still applies everywhere. Not compatible with modality tiling. [Details](../CLAUDE.md#prompt-relay---segment). | `generate` modes |
+| `--segment "TEXT" [LEN]` | — | Prompt Relay: a local prompt gated to a slice of the timeline, repeatable in timeline order. `LEN` is in latent frames. The global `--prompt` still applies everywhere. Validated on 2.3 and 2.5 packs. Not compatible with modality tiling. [Details](../CLAUDE.md#prompt-relay---segment). | `generate` modes |
 | `--relay-epsilon` | 1e-3 | Prompt Relay falloff. Smaller is sharper temporal gating. | with `--segment` |
 | `--relay-strength` | 1.0 | Prompt Relay penalty multiplier. Higher isolates segments more strictly. | with `--segment` |
 
@@ -312,6 +321,9 @@ and ignored.
 `a2v --distilled` takes the `a2v` column except the CFG and TeaCache flags: `--cfg-scale`,
 `--stg-scale`, `--negative-prompt` and `--enable-teacache` are rejected up front.
 
+`retake --distilled` takes the `retake` column except the CFG flags: `--cfg-scale`,
+`--stg-scale` and `--negative-prompt` are rejected up front.
+
 ## Progress output (stderr)
 
 All CLI progress goes to **stderr** so stdout stays clean for callers that pipe it:
@@ -334,4 +346,5 @@ All CLI progress goes to **stderr** so stdout stays clean for callers that pipe 
 - `generate --one-stage` vs `generate --two-stage`: same dev model + CFG, but `--one-stage` runs **once at the target resolution** (no upscaler dependency, simpler latents for downstream). `--two-stage` runs at half-res then upscales 2× and refines (typically faster overall and better at large targets). Pick `--one-stage` for native res ≤ 704 × 480 or if you don't trust the upsampler; pick `--two-stage` for everything else.
 - `generate --distilled` vs `generate --two-stage`: same half-res + upscale structure, but `--distilled` skips CFG entirely (8 stage 1 steps × 1 forward instead of 30 × 2-4). Fastest mode; quality slightly below the dev+CFG variants.
 - `a2v --distilled` vs `a2v`: the same audio conditioning (the input track frozen in both stages, its waveform muxed into the output), but the distilled transformer without CFG: 8 + 3 single forwards instead of 30 guided steps and a LoRA-fused refine. On an M1 Max (2.5 q8, default environment), 512 × 768, 49 frames: 109 s against 631 s.
+- `retake --distilled` vs `retake`: the same window mask and audio handling, but the distilled transformer without CFG: 8 forwards instead of 30 steps × 4 passes over the whole clip. On an M1 Max (2.5 q8, default environment), 512 × 768, 49 frames: 148 s against 1793 s.
 - `--video-decoder diffusion` (LTX 2.5 packs only, experimental) reproduces upstream's **default** `chunked_eager` stage-5 mode exactly: the neighborhood-attention stage runs on four width slabs with a halo, so the first/last ~20 px of each row are edge-replicated rather than attending over the full volume — identical to upstream's own default-mode output, not a port shortfall. Decodes above the memory budget are tiled automatically (`--diffvae-tile` to override); conv remains the default decoder.
