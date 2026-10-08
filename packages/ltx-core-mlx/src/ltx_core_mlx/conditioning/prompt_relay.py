@@ -70,10 +70,14 @@ def map_token_ranges(
 
     Uses incremental tokenization (measuring cumulative prefixes) to sidestep
     SentencePiece context-dependency, mirroring the reference implementation.
-    The tokenizer is an mlx-lm tokenizer whose ``.encode()`` returns a token-id list.
+    The tokenizer is the text encoder's own, whose ``.encode()`` returns a token-id
+    list: the mlx-lm Gemma-3 tokenizer on 2.3 packs (prepends ``<bos>``), the pack's
+    HuggingFace Gemma-4 tokenizer on 2.5 packs (no ``<bos>``, no ``<eos>``). Either
+    way the encoder tokenizes with the same ``.encode()``, so the counts below are
+    the column offsets it produces (``tests/test_prompt_relay_ltx25.py``).
 
     Args:
-        tokenizer: mlx-lm tokenizer (``pipe.prompt_encoder._text_encoder._tokenizer``).
+        tokenizer: The text encoder's tokenizer (``pipe.prompt_encoder._text_encoder._tokenizer``).
         global_prompt: Prompt applied to every frame.
         local_prompts: Ordered per-segment prompts, gated to their time windows.
         max_length: Encoder sequence limit (``LTX2_GEMMA_MAX_LENGTH``). When set,

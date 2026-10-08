@@ -757,11 +757,30 @@ examples:
     ret.add_argument("--video", "-v", required=True, help="Source video file")
     ret.add_argument("--start", type=int, required=True, help="Start latent frame index (inclusive)")
     ret.add_argument("--end", type=int, required=True, help="End latent frame index (exclusive)")
-    ret.add_argument("--steps", type=int, default=None, help="Denoising steps (default: 30)")
-    ret.add_argument("--cfg-scale", type=float, default=None, help="CFG guidance scale (default: 3.0)")
+    ret.add_argument(
+        "--distilled",
+        action="store_true",
+        help=(
+            "[experimental] Retake with the distilled model: the 8-step distilled sigma table, one forward per "
+            "step, no CFG (upstream RetakePipeline's default mode). --cfg-scale, --stg-scale and "
+            "--negative-prompt are rejected."
+        ),
+    )
+    ret.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help="Denoising steps (default: 30; with --distilled: 8, the full distilled table)",
+    )
+    ret.add_argument(
+        "--cfg-scale", type=float, default=None, help="CFG guidance scale (default: 3.0; rejected by --distilled)"
+    )
     _add_negative_prompt_arg(ret)
     ret.add_argument(
-        "--stg-scale", type=float, default=None, help="STG guidance scale (default: 1.0 — upstream LTX_2_3_PARAMS)"
+        "--stg-scale",
+        type=float,
+        default=None,
+        help="STG guidance scale (default: 1.0 — upstream LTX_2_3_PARAMS; rejected by --distilled)",
     )
     ret.add_argument("--no-regen-audio", action="store_true", help="Preserve original audio (don't regenerate)")
     ret.add_argument(
@@ -1544,16 +1563,25 @@ def _cmd_retake(args: argparse.Namespace) -> None:
     """Regenerate a time segment of an existing video."""
     t0 = time.time()
 
+    if args.distilled:
+        if args.cfg_scale is not None or args.stg_scale is not None:
+            raise SystemExit(
+                "retake --distilled runs the distilled flow (no CFG / STG); drop --cfg-scale / --stg-scale."
+            )
+        if args.negative_prompt is not None:
+            raise SystemExit("retake --distilled runs the distilled flow (no CFG); drop --negative-prompt.")
+
     from ltx_pipelines_mlx.retake import RetakePipeline
 
     if not args.quiet:
-        print("Mode: Retake")
+        print("Mode: Retake (distilled, no CFG)" if args.distilled else "Mode: Retake")
         print(f"Video: {args.video}, frames {args.start}-{args.end}")
 
     pipe = RetakePipeline(
         model_dir=args.model,
         gemma_model_id=args.gemma,
         low_ram_streaming=getattr(args, "low_ram", False),
+        distilled=args.distilled,
     )
     pipe.verbose = not args.quiet
     pipe.stepwise = _build_stepwise(args)
