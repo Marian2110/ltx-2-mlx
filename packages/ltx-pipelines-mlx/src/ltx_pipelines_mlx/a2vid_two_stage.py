@@ -101,7 +101,9 @@ def encode_source_audio(
         )
     audio_latent = audio_latent[:, :, :audio_T, :]
     audio_tokens, _ = pipe.audio_patchifier.patchify(audio_latent)  # (1, audio_T, 128)
-    mx.synchronize()
+    # Evaluate now, while the encoder is loaded: the tokens are lazy and ``mx.synchronize()`` only waits for
+    # work already queued, so without this the encoder stays referenced until stage 1 first reads them.
+    mx.eval(audio_tokens)
 
     # Free audio encoder via composition block
     if pipe.low_memory:

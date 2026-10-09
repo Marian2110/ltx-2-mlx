@@ -367,3 +367,32 @@ def test_cli_a2v_distilled_rejects_cfg_flags_before_building_anything(monkeypatc
     monkeypatch.setattr(a2vd_mod, "A2VidDistilledPipeline", must_not_build)
     with pytest.raises(SystemExit, match=message):
         cli._cmd_a2v(_a2v_args(tmp_path, "--distilled", *flags))
+
+
+def test_encode_source_audio_evaluates_the_tokens_before_freeing_the_encoder(monkeypatch):
+    """The tokens are materialised while the audio encoder is still loaded, then the encoder is freed."""
+    events: list[str] = []
+    monkeypatch.setattr(
+        a2v_mod, "load_audio", lambda *a, **k: SimpleNamespace(waveform=mx.zeros((1, 16000)), sample_rate=16000)
+    )
+    monkeypatch.setattr(a2v_mod, "encode_audio", lambda *a, **k: mx.zeros((1, 8, 16, 16), dtype=mx.bfloat16))
+    real_eval = a2v_mod.mx.eval
+
+    def spy_eval(*arrays):
+        events.append("eval")
+        return real_eval(*arrays)
+
+    monkeypatch.setattr(a2v_mod.mx, "eval", spy_eval)
+    pipe = SimpleNamespace(
+        _load_audio_encoder=lambda: None,
+        audio_encoder=object(),
+        audio_processor=object(),
+        audio_patchifier=SimpleNamespace(patchify=lambda latent: (latent.reshape(1, -1, 128), None)),
+        low_memory=True,
+        audio_conditioner=SimpleNamespace(free=lambda: events.append("free")),
+    )
+
+    tokens = a2v_mod.encode_source_audio(pipe, "a.wav", num_frames=9, frame_rate=24.0, start_time=0.0, max_duration=1.0)
+
+    assert events == ["eval", "free"]
+    assert tokens.shape[0] == 1
