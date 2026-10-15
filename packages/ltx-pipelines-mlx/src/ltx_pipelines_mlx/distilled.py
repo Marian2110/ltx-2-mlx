@@ -810,6 +810,8 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
         if self.low_memory:
             self.image_conditioner.free()
             self.upsampler = None
+            # load() must bring them back on the next generate_two_stage of this pipeline.
+            self._loaded = False
             aggressive_cleanup()
 
         # --- Stage 2: full resolution refine (no LoRA swap — already distilled) ---

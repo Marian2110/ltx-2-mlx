@@ -112,3 +112,13 @@ def test_resume_with_mismatched_arrays_raises(tmp_path, monkeypatch, field, valu
     with pytest.raises(ValueError, match=message):
         pipe2.generate_two_stage(**_GEN, stage1=bad)
     assert loop2.calls == []
+
+
+def test_a_low_memory_run_leaves_the_pipeline_ready_to_load_again(tmp_path, monkeypatch):
+    """Stage 2 frees the VAE encoder and the upsampler under low_memory; the next call must reload them."""
+    pipe, _, _ = _pipeline(tmp_path, monkeypatch, True)
+    pipe.low_memory = True
+    monkeypatch.setattr(pipe.image_conditioner, "free", lambda: None)
+    pipe._loaded = True
+    pipe.generate_two_stage(**_GEN)
+    assert pipe._loaded is False
