@@ -181,8 +181,11 @@ def test_distilled_retake_keeps_tokens_outside_the_window_bit_identical(distille
         assert mx.array_equal(out_video[:, :, f], video[:, :, f]).item(), f"latent frame {f}"
     assert not mx.array_equal(out_video[:, :, 1], video[:, :, 1]).item()
 
-    # Audio follows the same window (audio_T / F tokens per latent frame), the rest is kept.
-    start, end = round(1 * AUDIO_T / F), round(2 * AUDIO_T / F)
+    # Audio follows the same window in time (the tokens whose interval overlaps it), the rest is kept.
+    from ltx_pipelines_mlx.retake import audio_window_tokens
+
+    start, end = audio_window_tokens(1, 2, AUDIO_T, 24.0)
+    assert 0 < start < end < AUDIO_T
     assert mx.array_equal(out_audio[:, :, :start], audio[:, :, :start]).item()
     assert mx.array_equal(out_audio[:, :, end:], audio[:, :, end:]).item()
     assert not mx.array_equal(out_audio[:, :, start:end], audio[:, :, start:end]).item()
