@@ -146,7 +146,9 @@ class TI2VidTwoStagesHQPipeline(TI2VidTwoStagesPipeline):
         )
         num_text_tokens = video_embeds.shape[1]
         relay_mask = self._prompt_relay_mask_builder(prompt_relay, relay_token_ranges, num_text_tokens)
-        relay_audio_mask = self._prompt_relay_audio_mask_builder(prompt_relay, relay_token_ranges, num_text_tokens)
+        relay_audio_mask = self._prompt_relay_audio_mask_builder(
+            prompt_relay, relay_token_ranges, num_text_tokens, default_audio_strength=0.0
+        )
 
         # --- Load DiT + VAE encoder + upsampler ---
         if self.dit is None:

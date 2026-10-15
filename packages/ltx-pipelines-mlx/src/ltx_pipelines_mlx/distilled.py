@@ -549,7 +549,9 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
         # the mask is rebuilt each stage because tokens-per-frame (H*W) differs.
         num_text_tokens = video_embeds.shape[1]
         relay_mask = self._prompt_relay_mask_builder(prompt_relay, relay_token_ranges, num_text_tokens)
-        relay_audio_mask = self._prompt_relay_audio_mask_builder(prompt_relay, relay_token_ranges, num_text_tokens)
+        relay_audio_mask = self._prompt_relay_audio_mask_builder(
+            prompt_relay, relay_token_ranges, num_text_tokens, default_audio_strength=1.0
+        )
 
         # --- Load distilled DiT + VAE encoder + upsampler ---
         self.load()

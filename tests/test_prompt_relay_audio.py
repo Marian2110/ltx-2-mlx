@@ -117,7 +117,7 @@ def test_audio_mask_rejects_what_the_video_mask_rejects(kw, match):
 
 
 def test_relay_input_validates_audio_knobs_up_front():
-    assert PromptRelayInput(["a"]).audio_strength == 1.0
+    assert PromptRelayInput(["a"]).audio_strength is None  # the pipeline picks
     assert PromptRelayInput(["a"]).audio_epsilon is None
     with pytest.raises(ValueError, match="audio strength"):
         PromptRelayInput(["a"], audio_strength=-1.0)
@@ -135,10 +135,12 @@ def _audio(num_tokens: int = 101, frozen: bool = False) -> LatentState:
     )
 
 
-def _audio_builder(relay, ranges=((2, 4), (4, 6))):
+def _audio_builder(relay, ranges=((2, 4), (4, 6)), default=1.0):
     from ltx_pipelines_mlx._base import BasePipeline
 
-    return BasePipeline._prompt_relay_audio_mask_builder(relay, None if ranges is None else list(ranges), 8)
+    return BasePipeline._prompt_relay_audio_mask_builder(
+        relay, None if ranges is None else list(ranges), 8, default_audio_strength=default
+    )
 
 
 def test_builder_is_off_without_relay_or_with_zero_audio_strength():
@@ -580,7 +582,7 @@ def _captured_relay(tmp_path, monkeypatch, *extra: str):
 
 def test_cli_audio_flags_reach_the_relay(tmp_path, monkeypatch):
     relay = _captured_relay(tmp_path, monkeypatch, "--segment", "a", "--segment", "b")
-    assert (relay.audio_strength, relay.audio_epsilon) == (1.0, None)
+    assert (relay.audio_strength, relay.audio_epsilon) == (None, None)  # the pipeline's default
     relay = _captured_relay(
         tmp_path,
         monkeypatch,
@@ -599,3 +601,25 @@ def test_cli_audio_flags_reach_the_relay(tmp_path, monkeypatch):
 def test_cli_rejects_a_bad_audio_epsilon_before_building_the_pipeline(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="epsilon"):
         _captured_relay(tmp_path, monkeypatch, "--segment", "a", "--relay-audio-epsilon", "2")
+
+
+def test_builder_default_strength_applies_only_when_none_is_given():
+    assert _audio_builder(PromptRelayInput(["a", "b"]), default=0.0)(13, _audio()) is None
+    on = _audio_builder(PromptRelayInput(["a", "b"]), default=1.0)(13, _audio())
+    explicit = _audio_builder(PromptRelayInput(["a", "b"], audio_strength=1.0), default=0.0)(13, _audio())
+    assert on is not None and mx.array_equal(on, explicit).item()
+
+
+@pytest.mark.parametrize("name", _PIPELINES)
+def test_default_audio_relay_is_on_for_distilled_and_off_for_cfg(name, tmp_path, monkeypatch):
+    calls = _pipeline_calls(name, tmp_path, monkeypatch, PromptRelayInput(["a red car", "a blue sky"]))
+    generated = [c for c in calls if not c["audio_state"].frozen]
+    assert generated
+    if name.startswith("distilled"):
+        relay = PromptRelayInput(["a red car", "a blue sky"], audio_strength=1.0)
+        for call in generated:
+            expected = _expected_audio_mask(relay, 3, call["audio_state"].latent.shape[1])
+            assert mx.array_equal(call["audio_cross_attention_mask"], expected).item()
+    else:
+        assert all(c["audio_cross_attention_mask"] is None for c in calls)
+        assert all(c["video_cross_attention_mask"] is not None for c in calls)

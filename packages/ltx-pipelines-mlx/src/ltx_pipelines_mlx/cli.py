@@ -662,11 +662,12 @@ examples:
     gen.add_argument(
         "--relay-audio-strength",
         type=float,
-        default=1.0,
+        default=None,
         help=(
             "Prompt Relay penalty multiplier on the audio->text cross-attention (audio_attn2), so each "
             "segment's speech and sounds stay in its slice of the timeline. 0 = video-only relay. "
-            "Default: 1.0 (as the reference ComfyUI node)."
+            "Default: 1.0 on --distilled / --dfr (as the reference ComfyUI node), 0 on the CFG modes, "
+            "where it did not move the speech; set it to opt in there."
         ),
     )
     gen.add_argument(

@@ -858,6 +858,7 @@ class BasePipeline:
         prompt_relay: PromptRelayInput | None,
         token_ranges: list[tuple[int, int]] | None,
         num_text_tokens: int,
+        default_audio_strength: float,
     ) -> Callable[[int, LatentState | None], mx.array | None]:
         """Return a per-stage builder for the additive audio->text cross-attn bias (``audio_attn2``).
 
@@ -865,11 +866,23 @@ class BasePipeline:
         stage's audio tokens are laid on the video's latent-frame timeline (token *i* at
         ``i * latent_f / num_audio_tokens``), with the same segments as
         :meth:`_prompt_relay_mask_builder`. It returns ``None`` (and builds nothing) when
-        Prompt Relay is off, when ``prompt_relay.audio_strength`` is 0 (a video-only relay
-        then passes exactly what it passed before the audio mask existed), and for an absent
-        or frozen audio stream, which is conditioning and is not generated.
+        Prompt Relay is off, when the audio strength is 0 (a video-only relay then passes
+        exactly what it passed before the audio mask existed), and for an absent or frozen
+        audio stream, which is conditioning and is not generated.
+
+        ``default_audio_strength`` applies when ``prompt_relay.audio_strength`` is ``None``:
+        the distilled paths pass ``1.0``; the dev + CFG paths pass ``0.0``. On the CFG
+        two-stage path the audio mask did not move the speech into its segments (2.5 q8,
+        384x640x97, segments 6/7: one seed unchanged, another lost its first line, with
+        STG, the isolated-modality pass, audio CFG or the rescale changed one at a time),
+        so it is opt-in there.
         """
-        if token_ranges is None or prompt_relay.audio_strength == 0.0:
+        audio_strength = (
+            default_audio_strength
+            if prompt_relay is None or prompt_relay.audio_strength is None
+            else prompt_relay.audio_strength
+        )
+        if token_ranges is None or audio_strength == 0.0:
             return lambda latent_f, audio_state: None
         from ltx_core_mlx.conditioning.prompt_relay import (
             build_relay_mask_audio,
@@ -891,7 +904,7 @@ class BasePipeline:
                 latent_frames=latent_f,
                 num_text_tokens=num_text_tokens,
                 epsilon=epsilon,
-                strength=prompt_relay.audio_strength,
+                strength=audio_strength,
             )
 
         return _build

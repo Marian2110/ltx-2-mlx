@@ -286,7 +286,7 @@ would otherwise not fit. On a 32 GB Mac at typical token counts, prefer `--low-r
 | `--segment "TEXT" [LEN]` | — | Prompt Relay: a local prompt gated to a slice of the timeline (video and audio), repeatable in timeline order. `LEN` is in latent frames. The global `--prompt` still applies everywhere. Validated on 2.3 and 2.5 packs. Not compatible with modality tiling. [Details](../CLAUDE.md#prompt-relay---segment). | `generate` modes |
 | `--relay-epsilon` | 1e-3 | Prompt Relay falloff. Smaller is sharper temporal gating. | with `--segment` |
 | `--relay-strength` | 1.0 | Prompt Relay penalty multiplier on the video cross-attention. Higher isolates segments more strictly. | with `--segment` |
-| `--relay-audio-strength` | 1.0 | Prompt Relay penalty multiplier on the audio cross-attention (`audio_attn2`), so each segment's speech and sounds stay near its slice of the timeline. `0` gates the video only (the behaviour before this flag existed). No effect on a frozen audio stream (`--two-stage` stage 2). | with `--segment` |
+| `--relay-audio-strength` | 1.0 on `--distilled` / `--dfr`, 0 on the CFG modes | Prompt Relay penalty multiplier on the audio cross-attention (`audio_attn2`), so each segment's speech and sounds stay near its slice of the timeline. `0` gates the video only (the behaviour before this flag existed). Off by default on the CFG modes, where it did not move the speech; any value given is used. No effect on a frozen audio stream (`--two-stage` stage 2). | with `--segment` |
 | `--relay-audio-epsilon` | `--relay-epsilon` | Prompt Relay falloff of the audio penalty, in (0, 1). | with `--segment` |
 
 ## Flags by pipeline

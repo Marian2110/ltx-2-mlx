@@ -570,7 +570,7 @@ ltx-2-mlx generate --distilled --prompt "cinematic, a woman in a bedroom" \
   --segment "standing and turning to the window" --frame-rate 24 -o out.mp4
 ```
 
-Flags: `--segment "TEXT" [LEN_FRAMES]` (repeatable, timeline order; LEN in latent frames, omit to auto-distribute), `--relay-epsilon` (default 1e-3, smaller = sharper), `--relay-strength` (default 1.0, video penalty), `--relay-audio-strength` (default 1.0, audio penalty; `0` = video-only relay, exactly the pre-audio behaviour), `--relay-audio-epsilon` (default: `--relay-epsilon`). Works on all `generate` modes; on CFG modes the masks apply to the **positive passes only** (never the negative). **Not compatible with modality tiling** (raises). Correctness hinges on the Gemma connector front-packing valid tokens to column *i* (`_replace_padding_with_registers`) — token *i* in encode order → column *i* in the `Nk` axis. Inert on the default path (no `--segment` → both `video_cross_attention_mask` and `audio_cross_attention_mask` are `None`, byte-identical output). Key files: `conditioning/prompt_relay.py` (`build_relay_mask`, `build_relay_mask_audio`); `video_cross_attention_mask` / `audio_cross_attention_mask` kwargs threaded `LTXModel → BasicAVTransformerBlock → attn2` / `audio_attn2` by the four sampler loops; per-stage builders `BasePipeline._prompt_relay_mask_builder` / `_prompt_relay_audio_mask_builder`.
+Flags: `--segment "TEXT" [LEN_FRAMES]` (repeatable, timeline order; LEN in latent frames, omit to auto-distribute), `--relay-epsilon` (default 1e-3, smaller = sharper), `--relay-strength` (default 1.0, video penalty), `--relay-audio-strength` (default 1.0 on `--distilled` / `--dfr`, 0 on the CFG modes; audio penalty; `0` = video-only relay, exactly the pre-audio behaviour), `--relay-audio-epsilon` (default: `--relay-epsilon`). Works on all `generate` modes; on CFG modes the masks apply to the **positive passes only** (never the negative). **Not compatible with modality tiling** (raises). Correctness hinges on the Gemma connector front-packing valid tokens to column *i* (`_replace_padding_with_registers`) — token *i* in encode order → column *i* in the `Nk` axis. Inert on the default path (no `--segment` → both `video_cross_attention_mask` and `audio_cross_attention_mask` are `None`, byte-identical output). Key files: `conditioning/prompt_relay.py` (`build_relay_mask`, `build_relay_mask_audio`); `video_cross_attention_mask` / `audio_cross_attention_mask` kwargs threaded `LTXModel → BasicAVTransformerBlock → attn2` / `audio_attn2` by the four sampler loops; per-stage builders `BasePipeline._prompt_relay_mask_builder` / `_prompt_relay_audio_mask_builder`.
 
 **On 2.5 packs.** The Gemma-4 text encoder tokenizes with the pack's HuggingFace `tokenizer.json`, which (unlike the
 mlx-lm Gemma-3 tokenizer of the 2.3 packs) adds no `<bos>` and no `<eos>`; `map_token_ranges` measures with the same
@@ -606,8 +606,9 @@ tokens), within the 1 s resolution of the step timer.
 **Audio (`audio_attn2`).** The reference node patches `audio_attn2` with the same segments. Audio tokens (25 per
 second) do not map to whole latent frames, so token *i* of `Na` sits at `i * F / Na` latent frames
 (`build_relay_mask_audio`, the reference's `build_temporal_cost_scaled`): same midpoints and plateau half-widths as the
-video mask, its own `--relay-audio-strength` (default 1.0, the reference's `audio_strength`, independent of
-`--relay-strength`) and `--relay-audio-epsilon` (default: inherit, as the reference's `audio_epsilon=0`). Inert on a
+video mask, its own `--relay-audio-strength` (default 1.0 on the distilled paths, the reference's `audio_strength`,
+independent of `--relay-strength`; 0 on the CFG modes, see below; `PromptRelayInput.audio_strength=None` lets the
+pipeline pick, `_prompt_relay_audio_mask_builder(..., default_audio_strength=...)`) and `--relay-audio-epsilon` (default: inherit, as the reference's `audio_epsilon=0`). Inert on a
 frozen audio stream (`--two-stage` stage 2, a2v): `_prompt_relay_audio_mask_builder` builds nothing for it and the
 four loops drop the kwarg (`_audio_relay_mask`). `--relay-audio-strength 0` passes `None`, so a video-only relay is
 byte-identical to the relay before this flag existed.
@@ -632,6 +633,15 @@ past a 2.04 s boundary and lies entirely after a 1.04 s one); with the audio mas
 lip sync stays in range. One overlap: with 9 / 4 "See" starts 0.27 s before the video boundary (the audio mapping
 places latent frame 9 at 2.80 s, not 2.71 s, see the reference's mapping above). 8 s (512×768×193, 13 / 12 auto split,
 boundary 4.04 s): "See you tomorrow" at 6.39–7.22 s without relay, 4.44–5.74 s with the audio relay.
+
+**Off by default on the CFG modes.** On `--two-stage` (dev + CFG, audio CFG 7.0) the audio mask did not move the speech
+into its segments (2.5 q8, 384×640×97, segments 6 / 7, boundary 2.04 s, Whisper word timings). Seed 11: the same words at
+the same times with and without it ("Good morning" 0.00–1.08 s, "See you tomorrow" 1.54–2.64 s). Seed 5: without it
+"Good morning" 1.12–2.14 s and "See you tomorrow" 2.86–3.78 s; with it the first line was lost and the second spoken
+across the boundary, at audio strength 1.0 and 0.5 alike, with STG off, with the isolated-modality pass off, and with
+audio CFG 1.0 (garbled) or rescale 0 (silent). One knob at a time, one run each; the cause was not isolated. The CFG
+modes therefore default to a video-only relay (byte-identical to the relay before the audio mask); an explicit
+`--relay-audio-strength` still applies there.
 
 **Cost.** Each mask is built once per stage on the CPU (video 3 ms / 10 MB bf16 at 4,992 tokens, 10 ms / 37 MB at
 17,856; audio 0.1 ms / 0.2 MB) and reused by every step, pass and block. Under `LTX2_COMPUTE_DTYPE=float16` it reaches

@@ -48,9 +48,11 @@ class PromptRelayInput:
         epsilon: Plateau→penalty falloff (smaller = sharper temporal gating).
         strength: Multiplier on the video penalty magnitude.
         audio_strength: Multiplier on the audio penalty (``audio_attn2``). ``0``
-            leaves the audio cross-attention unmasked (video-only relay). Default
-            ``1.0``, the reference's ``audio_strength`` default (independent of
-            ``strength``, as there).
+            leaves the audio cross-attention unmasked (video-only relay). ``None``
+            (default) lets the pipeline pick: ``1.0`` (the reference's default,
+            independent of ``strength``) on the distilled paths, ``0`` on the dev +
+            CFG paths, where the audio mask was not seen to move the speech (see
+            ``BasePipeline._prompt_relay_audio_mask_builder``).
         audio_epsilon: Falloff of the audio penalty; ``None`` inherits ``epsilon``
             (the reference's ``audio_epsilon=0`` "inherit" default).
     """
@@ -59,12 +61,12 @@ class PromptRelayInput:
     segment_lengths: list[int | None] | None = None
     epsilon: float = 1e-3
     strength: float = 1.0
-    audio_strength: float = 1.0
+    audio_strength: float | None = None
     audio_epsilon: float | None = None
 
     def __post_init__(self) -> None:
         # Checked here, i.e. before any model load, rather than when the mask is built.
-        if self.audio_strength < 0.0:
+        if self.audio_strength is not None and self.audio_strength < 0.0:
             raise ValueError(f"Prompt Relay audio strength must be >= 0, got {self.audio_strength}")
         if self.audio_epsilon is not None:
             _relay_sigma(self.audio_epsilon)
