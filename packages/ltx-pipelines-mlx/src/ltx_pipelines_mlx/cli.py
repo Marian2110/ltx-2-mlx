@@ -793,6 +793,21 @@ examples:
             "With music or loud ambience, pass the isolated vocals."
         ),
     )
+    a2v.add_argument(
+        "--dfr",
+        action="store_true",
+        help=(
+            "[experimental] A2V on the DFR base path (LTX 2.5 packs): --distilled's frozen input audio, with "
+            "generate --dfr's keyframe canvas and full-resolution stage 2 with the detailing IC-LoRA (see "
+            "--detailing-lora). No temporal rounds or spatial epilogue."
+        ),
+    )
+    a2v.add_argument(
+        "--detailing-lora",
+        default=DEFAULT_DETAILING_LORA,
+        metavar="PATH_OR_REPO",
+        help="Detailing IC-LoRA for a2v --dfr (local .safetensors or HF repo id; default: the official, gated LoRA).",
+    )
     a2v.add_argument("--stage1-steps", type=int, default=None, help="Stage 1 steps (default: 30; with --distilled: 8)")
     a2v.add_argument("--stage2-steps", type=int, default=None, help="Stage 2 steps (default: 3)")
     a2v.add_argument(
@@ -1608,13 +1623,25 @@ def _cmd_a2v(args: argparse.Namespace) -> None:
     """Generate video from audio + text prompt."""
     t0 = time.time()
 
-    if args.distilled:
+    pipe_kwargs: dict = {}
+    if args.distilled and args.dfr:
+        raise SystemExit("a2v takes --distilled or --dfr, not both.")
+    if not args.dfr and args.detailing_lora != DEFAULT_DETAILING_LORA:
+        raise SystemExit("--detailing-lora only applies with a2v --dfr.")
+    if args.distilled or args.dfr:
+        flag = "--dfr" if args.dfr else "--distilled"
         if args.cfg_scale is not None or args.stg_scale is not None:
-            raise SystemExit("a2v --distilled runs the distilled flow (no CFG / STG); drop --cfg-scale / --stg-scale.")
+            raise SystemExit(f"a2v {flag} runs the distilled flow (no CFG / STG); drop --cfg-scale / --stg-scale.")
         if args.negative_prompt is not None:
-            raise SystemExit("a2v --distilled runs the distilled flow (no CFG); drop --negative-prompt.")
+            raise SystemExit(f"a2v {flag} runs the distilled flow (no CFG); drop --negative-prompt.")
         if args.enable_teacache:
-            raise SystemExit("a2v --distilled runs the distilled flow; TeaCache does not apply.")
+            raise SystemExit(f"a2v {flag} runs the distilled flow; TeaCache does not apply.")
+    if args.dfr:
+        from ltx_pipelines_mlx.a2vid_dfr import A2VidDFRPipeline as PipeClass
+
+        pipe_kwargs["detailing_lora"] = args.detailing_lora
+        mode_name = "Audio-to-Video (DFR base path, no CFG)"
+    elif args.distilled:
         from ltx_pipelines_mlx.a2vid_distilled import A2VidDistilledPipeline as PipeClass
 
         mode_name = "Audio-to-Video (distilled, no CFG)"
@@ -1632,6 +1659,7 @@ def _cmd_a2v(args: argparse.Namespace) -> None:
         model_dir=args.model,
         gemma_model_id=args.gemma,
         low_ram_streaming=getattr(args, "low_ram", False),
+        **pipe_kwargs,
     )
     pipe.verbose = not args.quiet
     pipe.stepwise = _build_stepwise(args)
