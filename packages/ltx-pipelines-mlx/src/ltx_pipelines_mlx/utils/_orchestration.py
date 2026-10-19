@@ -307,6 +307,9 @@ def combined_image_conditionings(
         img_tensor = img_tensor[:, :, None, :, :]  # add F=1 dim
         ref_latent = video_encoder.encode(img_tensor)  # (1, 128, 1, H', W')
         ref_tokens = ref_latent.transpose(0, 2, 3, 4, 1).reshape(1, -1, 128)
+        # Evaluate while the encoder is loaded: left lazy, the encode would run inside the first
+        # denoising step, with the VAE encoder still referenced next to the DiT.
+        mx.eval(ref_tokens)
 
         if img.frame_idx == 0:
             conditionings.append(
