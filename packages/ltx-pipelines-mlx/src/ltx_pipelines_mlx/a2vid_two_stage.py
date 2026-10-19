@@ -349,8 +349,7 @@ class A2VidPipelineTwoStage(TI2VidTwoStagesPipeline):
                     video_encoder=encoder,
                     frame_rate=frame_rate,
                 )
-                mx.synchronize()
-                return conds
+                return conds  # evaluated by combined_image_conditionings
 
             conditionings_1 = self.image_conditioner(_encode_combined, free_after=self.low_memory)
             if self.low_memory:
@@ -422,7 +421,8 @@ class A2VidPipelineTwoStage(TI2VidTwoStagesPipeline):
             v_denorm = encoder.denormalize_latent(v_mlx).transpose(0, 4, 1, 2, 3)
             v_up = self.upsampler(v_denorm)
             v_up_renorm = encoder.normalize_latent(v_up.transpose(0, 2, 3, 4, 1)).transpose(0, 4, 1, 2, 3)
-            mx.synchronize()
+            # Evaluate before the encoder is freed (``mx.synchronize()`` only waits for queued work).
+            mx.eval(v_up_renorm)
             conds: list = []
             if resolved_images:
                 enc_h_full = H_full * 32

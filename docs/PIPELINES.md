@@ -91,7 +91,7 @@ Everything else is in [Common flags](#common-flags).
 ### `ic-lora`
 
 - **Produces:** control-conditioned video from a control clip (canny, depth, pose, motion tracks) plus an official Lightricks IC-LoRA.
-- **Packs:** 2.3 only. No official 2.5 task IC-LoRAs exist yet. **Tier:** Stable.
+- **Packs:** 2.3, and 2.5 with the IC-LoRAs Lightricks has published for it (`Lightricks/LTX-2.5-22b-IC-LoRA-*`: Refine-Details, Restore, Deblur, Colorization, Ingredients, …); on 2.5 run end to end with Refine-Details (768 × 512 × 49, two stages, see #220 for the clean stage 2). Workflows that keep the IC-LoRA in stage 2 (upstream's `stage_2_ic_lora=True` plans) are not ported. **Tier:** Stable.
 - **Required:** `--prompt`, `--output`, `--frame-rate`, `--lora PATH STRENGTH`, `--video-conditioning PATH STRENGTH`.
 - **Own flags:** `--frames` (97), `--conditioning-strength` (1.0), `--skip-stage-2`, `--upsample-only`, `--refine-steps`, `--single-stage`, `--stage1-steps`, `--stage2-steps`, `--dev-transformer`, `--distilled-lora`, `--distilled-lora-strength` (0.5 in dev mode), `--image`.
 - **Example:**

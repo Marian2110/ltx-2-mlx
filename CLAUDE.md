@@ -1557,7 +1557,8 @@ dtype on entry (like the conv decoder) and the same decode peaks at ~12 GB (5.8 
 | `keyframe` | supported — validated e2e on 2.5 (deterministic, audio -38.3 dB; requires `--dev-transformer transformer-dev.safetensors`) |
 | `a2v` | supported — validated e2e on 2.5 (deterministic, conditioned audio faithfully reconstructed at -36.2 dB). `a2v --distilled` (Experimental): validated e2e on 2.5 q8 at 512×768×49 (± `--low-ram`) and 704×1280×121/241 |
 | `retake`, `extend` | supported — validated e2e on 2.5 (retake deterministic ×2; extend +N latent frames). `--low-ram` wired (mirrors upstream `offload_mode`): 49-frame retake that OOM'd now peaks at 13.8 GB. `retake --distilled` (Experimental): validated e2e on 2.5 q8 at 512×768×49 and 704×1280×121; `extend --distilled` (Experimental): validated e2e on 2.5 q8 at 704×1280, 10 s + 4 s (see Retake / Extend Example) |
-| `ic-lora`, `lipdub` | not yet supported (no official 2.5 task IC-LoRAs published yet) |
+| `ic-lora` | runs with the IC-LoRAs Lightricks has published for 2.5 (`Lightricks/LTX-2.5-22b-IC-LoRA-*`); run end to end with Refine-Details at 768×512×49 (M1 Max, q8, float16: 140 s fused, 127 s with `LTX2_LORA_MODE=unfused`). Upstream's plans that keep the IC-LoRA in stage 2 (`stage_2_ic_lora=True`) are not ported |
+| `lipdub` | not yet on 2.5 (no 2.5 Dub-It LoRA published) |
 | `hdr-ic-lora` | supported, **2.5 only** (upstream v1.4 SDR-to-HDR IC-LoRA, ACEScct); Experimental, validated end to end on real weights (see "HDR IC-LoRA Pipeline" › Status) |
 | `enhance` / `--enhance-prompt` | raises `NotImplementedError` (`_guard_enhance_not_gemma4`) — Gemma 3 only |
 | `--enable-teacache` | raises `ValueError` — 2.3 polynomial isn't calibrated for 2.5 |
@@ -1568,8 +1569,7 @@ dtype on entry (like the conv decoder) and the same decode peaks at ~12 GB (5.8 
 | DFR (`DFRPipeline`) | complete — shipped as `generate --dfr`: base path (spatial detailing with the official 2.5 detailing IC-LoRA), keyframe-aware decode on `--video-decoder diffusion`, temporal rounds (`--temporal-upscalings {1,2}`), and the spatial epilogue (`--spatial-upscalings {1,2}`) |
 | Diffusion video decoder | opt-in `--video-decoder diffusion` (experimental; tiled automatically above the decode budget, `--diffvae-tile` override); conv remains default |
 
-The IC-LoRA family (`ic-lora` / `lipdub`) lands once
-Lightricks publishes the official 2.5 task IC-LoRAs.
+`lipdub` lands on 2.5 once Lightricks publishes a 2.5 Dub-It LoRA.
 
 ### Conv VAE decode budget and auto tiling
 
