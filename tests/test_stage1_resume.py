@@ -57,7 +57,14 @@ def test_resume_skips_stage_1_and_is_bit_identical(tmp_path, monkeypatch, ltx25)
     # A second pipeline, as after a restart: only the arrays of the captured stage 1 travel.
     pipe2, loop2, encoded2 = _pipeline(tmp_path / "again", monkeypatch, ltx25)
     saved = dataclasses.replace(
-        stage1, x0_model=None, relay_mask=None, video_embeds=None, audio_embeds=None, resolved_images=[], nag=None
+        stage1,
+        x0_model=None,
+        relay_mask=None,
+        relay_audio_mask=None,
+        video_embeds=None,
+        audio_embeds=None,
+        resolved_images=[],
+        nag=None,
     )
     video2, audio2 = pipe2.generate_two_stage(**_GEN, stage1=saved)
 

@@ -684,6 +684,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
                     video_embeds=video_embeds,
                     audio_embeds=audio_embeds,
                     relay_mask=relay_mask,
+                    relay_audio_mask=relay_audio_mask,
                     x0_model=x0_model,
                     nag=nag_guidance,
                 ),
