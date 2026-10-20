@@ -642,8 +642,9 @@ examples:
             "Form: TEXT [LEN_FRAMES] (LEN_FRAMES in latent frames; omit to auto-distribute "
             "evenly). Repeatable, in timeline order — e.g. --segment 'a red car' "
             "--segment 'a blue sky'. The global --prompt applies to all frames. "
-            "Works on all generate modes (video cross-attention); on CFG modes the mask "
-            "applies to the conditional pass only. Not compatible with modality tiling."
+            "Works on all generate modes (video and audio cross-attention, see "
+            "--relay-audio-strength); on CFG modes the masks apply to the conditional pass "
+            "only. Not compatible with modality tiling."
         ),
     )
     gen.add_argument(
@@ -657,6 +658,23 @@ examples:
         type=float,
         default=1.0,
         help="Prompt Relay penalty multiplier (higher = stricter segment isolation). Default: 1.0.",
+    )
+    gen.add_argument(
+        "--relay-audio-strength",
+        type=float,
+        default=None,
+        help=(
+            "Prompt Relay penalty multiplier on the audio->text cross-attention (audio_attn2), so each "
+            "segment's speech and sounds stay in its slice of the timeline. 0 = video-only relay. "
+            "Default: 1.0 on --distilled / --dfr (as the reference ComfyUI node), 0 on the CFG modes, "
+            "where it did not move the speech; set it to opt in there."
+        ),
+    )
+    gen.add_argument(
+        "--relay-audio-epsilon",
+        type=float,
+        default=None,
+        help="Prompt Relay falloff for the audio mask, in (0, 1). Default: --relay-epsilon.",
     )
     gen.add_argument("--steps", type=int, default=None, help="Denoising steps for one-stage (default: 30)")
     gen.add_argument(
@@ -1339,6 +1357,8 @@ def _cmd_generate(args: argparse.Namespace) -> None:
             segment_lengths=specified if any(length is not None for length in specified) else None,
             epsilon=args.relay_epsilon,
             strength=args.relay_strength,
+            audio_strength=args.relay_audio_strength,
+            audio_epsilon=args.relay_audio_epsilon,
         )
 
     if args.enable_teacache and not (args.two_stages_hq or args.two_stage):

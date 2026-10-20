@@ -93,7 +93,8 @@ class Stage1Result:
         resolved_images: Resolved multi-anchor I2V conditioning inputs.
         video_embeds: Video text embeddings from prompt encoding.
         audio_embeds: Audio text embeddings from prompt encoding.
-        relay_mask: Prompt Relay cross-attention mask builder.
+        relay_mask: Prompt Relay video cross-attention mask builder.
+        relay_audio_mask: Prompt Relay audio cross-attention mask builder.
         x0_model: The stage 1 X0 model, reused for stage 2 when tiling is off; ``None`` once
             released (DFR drops it before its temporal rounds reload a clean DiT).
         nag: Normalized Attention Guidance input (encoded negative prompt + settings) for every
@@ -108,6 +109,7 @@ class Stage1Result:
     video_embeds: mx.array
     audio_embeds: mx.array
     relay_mask: Callable
+    relay_audio_mask: Callable
     x0_model: X0Model | None
     nag: NAGGuidance | None = None
 
@@ -223,6 +225,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
         audio_text_embeds: mx.array,
         sigmas: list[float],
         video_cross_attention_mask: mx.array | None,
+        audio_cross_attention_mask: mx.array | None = None,
         on_step,
         seed: int,
         ancestral: bool,
@@ -261,6 +264,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
                 audio_text_embeds=audio_text_embeds,
                 sigmas=sigmas,
                 video_cross_attention_mask=video_cross_attention_mask,
+                audio_cross_attention_mask=audio_cross_attention_mask,
                 on_step=on_step,
                 **nag_kwargs,
             )
@@ -275,6 +279,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             stepper=EulerAncestralDiffusionStep(eta=ANCESTRAL_ETA, s_noise=ANCESTRAL_S_NOISE),
             noise_seed=seed + noise_seed_offset,
             video_cross_attention_mask=video_cross_attention_mask,
+            audio_cross_attention_mask=audio_cross_attention_mask,
             on_step=on_step,
             **nag_kwargs,
         )
@@ -544,6 +549,9 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
         # the mask is rebuilt each stage because tokens-per-frame (H*W) differs.
         num_text_tokens = video_embeds.shape[1]
         relay_mask = self._prompt_relay_mask_builder(prompt_relay, relay_token_ranges, num_text_tokens)
+        relay_audio_mask = self._prompt_relay_audio_mask_builder(
+            prompt_relay, relay_token_ranges, num_text_tokens, default_audio_strength=1.0
+        )
 
         # --- Load distilled DiT + VAE encoder + upsampler ---
         self.load()
@@ -619,6 +627,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
             audio_text_embeds=audio_embeds,
             sigmas=sigmas_1,
             video_cross_attention_mask=relay_mask(F, H_half, W_half, video_state.latent.shape[1]),
+            audio_cross_attention_mask=relay_audio_mask(F, audio_state),
             on_step=self._stepwise_hook(F, H_half, W_half, stage=1),
             seed=seed,
             ancestral=self._is_25,
@@ -645,6 +654,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
                 video_embeds=video_embeds,
                 audio_embeds=audio_embeds,
                 relay_mask=relay_mask,
+                relay_audio_mask=relay_audio_mask,
                 x0_model=x0_model,
                 nag=nag_guidance,
             ),
@@ -712,6 +722,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
         video_embeds = stage1.video_embeds
         audio_embeds = stage1.audio_embeds
         relay_mask = stage1.relay_mask
+        relay_audio_mask = stage1.relay_audio_mask
         x0_model = stage1.x0_model
 
         H_full = H_half * 2
@@ -784,6 +795,7 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
                 audio_text_embeds=audio_embeds,
                 sigmas=sigmas_2,
                 video_cross_attention_mask=relay_mask(F, H_full, W_full, video_state_2.latent.shape[1]),
+                audio_cross_attention_mask=relay_audio_mask(F, audio_state_2),
                 on_step=self._stepwise_hook(F, H_full, W_full, stage=2),
                 seed=seed,
                 ancestral=self._is_25,
