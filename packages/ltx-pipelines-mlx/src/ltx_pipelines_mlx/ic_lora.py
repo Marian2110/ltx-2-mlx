@@ -685,6 +685,9 @@ class ICLoraPipeline(BasePipeline):
         # present to consume the re-appended reference tokens.
         if not self.dev_mode and not control_aware_refine:
             self._reload_clean_transformer()
+            # Stage 1's X0Model still wraps the transformer it was built on, which a reload (fused LoRAs on a
+            # resident model) replaces: stage 2 has to run on the reloaded one, or it keeps the IC-LoRA.
+            x0_model = X0Model(self.dit)
 
         video_tokens_up, _ = self.video_patchifier.patchify(video_upscaled)
 
