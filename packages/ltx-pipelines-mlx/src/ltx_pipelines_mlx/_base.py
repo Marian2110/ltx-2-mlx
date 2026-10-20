@@ -854,6 +854,62 @@ class BasePipeline:
         return _build
 
     @staticmethod
+    def _prompt_relay_audio_mask_builder(
+        prompt_relay: PromptRelayInput | None,
+        token_ranges: list[tuple[int, int]] | None,
+        num_text_tokens: int,
+        default_audio_strength: float,
+    ) -> Callable[[int, LatentState | None], mx.array | None]:
+        """Return a per-stage builder for the additive audio->text cross-attn bias (``audio_attn2``).
+
+        The closure takes ``(latent_f, audio_state)`` and is called once per stage: the
+        stage's audio tokens are laid on the video's latent-frame timeline (token *i* at
+        ``i * latent_f / num_audio_tokens``), with the same segments as
+        :meth:`_prompt_relay_mask_builder`. It returns ``None`` (and builds nothing) when
+        Prompt Relay is off, when the audio strength is 0 (a video-only relay then passes
+        exactly what it passed before the audio mask existed), and for an absent or frozen
+        audio stream, which is conditioning and is not generated.
+
+        ``default_audio_strength`` applies when ``prompt_relay.audio_strength`` is ``None``:
+        the distilled paths pass ``1.0``; the dev + CFG paths pass ``0.0``. On the CFG
+        two-stage path the audio mask did not move the speech into its segments (2.5 q8,
+        384x640x97, segments 6/7: one seed unchanged, another lost its first line, with
+        STG, the isolated-modality pass, audio CFG or the rescale changed one at a time),
+        so it is opt-in there.
+        """
+        audio_strength = (
+            default_audio_strength
+            if prompt_relay is None or prompt_relay.audio_strength is None
+            else prompt_relay.audio_strength
+        )
+        if token_ranges is None or audio_strength == 0.0:
+            return lambda latent_f, audio_state: None
+        from ltx_core_mlx.conditioning.prompt_relay import (
+            build_relay_mask_audio,
+            distribute_segment_lengths,
+        )
+
+        epsilon = prompt_relay.epsilon if prompt_relay.audio_epsilon is None else prompt_relay.audio_epsilon
+
+        def _build(latent_f: int, audio_state: LatentState | None) -> mx.array | None:
+            if audio_state is None or audio_state.frozen:
+                return None
+            seg_lengths = distribute_segment_lengths(
+                len(prompt_relay.local_prompts), latent_f, prompt_relay.segment_lengths
+            )
+            return build_relay_mask_audio(
+                token_ranges=token_ranges,
+                segment_lengths=seg_lengths,
+                num_audio_tokens=audio_state.latent.shape[1],
+                latent_frames=latent_f,
+                num_text_tokens=num_text_tokens,
+                epsilon=epsilon,
+                strength=audio_strength,
+            )
+
+        return _build
+
+    @staticmethod
     def _pre_denoise_flush(video_state: LatentState, audio_state: LatentState) -> None:
         """Force-materialise noised states before starting the denoise loop.
 
